@@ -4,6 +4,7 @@
  * The app is launched with a private HOME/HERMES_HOME/userData directory.
  */
 
+import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
@@ -22,6 +23,7 @@ import {
   writeProviderHome,
   type WsRecorder
 } from './harness'
+import { shellQuote } from './process-census'
 import { gate, startScriptedProvider } from './provider'
 
 // Keep this integration run out of /tmp and away from the installed app's
@@ -108,7 +110,7 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
 
   const provider = await startScriptedProvider()
   const sandbox = createCoreSandbox('session-workspace-native')
-  writeProviderHome(sandbox.hermesHome, provider.url)
+  writeProviderHome(sandbox.hermesHome, provider.url, '', 'manual')
 
   let app: ElectronApplication | undefined
   let ws: WsRecorder | undefined
@@ -146,7 +148,7 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
         await expect.poll(() => currentSessionId(page)).toBe('')
       }
 
-      provider.script(U(n), [{ text: [`${A(n)} synthetic answer ${n}`] }])
+      provider.script(U(n), [{ text: [`${A(n)} synthetic answer ${n}${n === 1 ? Array.from({ length: 70 }, (_, line) => `\n\nSynthetic reading-position line ${line + 1}.`).join('') : ''}`] }])
       await page.locator('[data-slot="composer-root"] [contenteditable="true"]').filter({ visible: true }).first().click()
       const composer = page.locator('[data-slot="composer-root"] [contenteditable="true"]').filter({ visible: true }).first()
       const prompt = `${U(n)} native workspace fixture ${n}`
@@ -333,6 +335,130 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     )
     expect(provider.completions.filter(item => item.aborted).map(item => item.marker)).toEqual([U(6)])
 
+    const tileThree = page.locator('section.session-workspace-card[aria-label]').filter({ hasText: A(3) })
+    const tileFour = page.locator('section.session-workspace-card[aria-label]').filter({ hasText: A(4) })
+    const victims = [7, 8].map(n => path.join(sandbox.root, `synthetic-approval-${n}`))
+    victims.forEach(victim => fs.mkdirSync(victim))
+
+    for (const n of [7, 8]) {
+      provider.script(U(n), [{ text: [`Approval ${n} `], toolCalls: [{ name: 'terminal', args: { command: `rm -rf ${shellQuote(victims[n - 7])}` } }] }, { text: [`${A(n)} fixture resolved`] }])
+    }
+
+    await sendInTile(tileThree, `${U(7)} approval fixture one`, ws)
+    await sendInTile(tileFour, `${U(8)} approval fixture two`, ws)
+    await expect(tileThree.locator('[data-approval-deny]')).toBeVisible({ timeout: 120000 })
+    await expect(tileFour.locator('[data-approval-run]')).toBeVisible({ timeout: 120000 })
+    expect(victims.every(victim => fs.existsSync(victim))).toBe(true)
+    await tileThree.locator('[data-approval-deny]').click()
+    await expect(tileFour.locator('[data-approval-run]')).toBeVisible()
+    await tileFour.locator('[data-approval-run]').click()
+    await expect.poll(() => fs.existsSync(victims[1])).toBe(false)
+    expect(fs.existsSync(victims[0])).toBe(true)
+    await expect(tileThree).toContainText(A(7))
+    await expect(tileFour).toContainText(A(8))
+    await page.setViewportSize({ width: 1600, height: 1000 })
+    const draft = tileOne.locator('[data-slot="composer-root"] [contenteditable="true"]').filter({ visible: true }).first()
+    await draft.click()
+    await draft.fill('日本語の下書き。移動しても保持する。')
+    await expect(draft).toContainText('日本語の下書き')
+    const draftHandle = await draft.elementHandle()
+    const transcript = tileOne.locator('[data-slot="aui_thread-viewport"]').first()
+    await transcript.evaluate(node => { node.scrollTop = 100 })
+    await expect.poll(() => transcript.evaluate(node => node.scrollTop)).toBe(100)
+    const mover = tileOne.locator('..').locator('.session-workspace-move')
+    const start = await mover.boundingBox()
+    const target = await page.locator('[data-workspace-slot="2"]').boundingBox()
+    expect(start).toBeTruthy()
+    expect(target).toBeTruthy()
+    await page.mouse.move(start!.x + 8, start!.y + 8)
+    await page.mouse.down()
+    await page.mouse.move(target!.x + target!.width / 2, target!.y + 50, { steps: 12 })
+    await expect(page.locator('.session-workspace-drop')).toBeVisible()
+    await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-drag.png') })
+    await page.mouse.up()
+    await expect(tileOne.locator('..')).toHaveAttribute('data-workspace-slot', '2')
+    expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
+    await expect(draft).toContainText('日本語の下書き')
+    expect(await transcript.evaluate(node => node.scrollTop)).toBe(100)
+    await mover.click()
+
+    await page.keyboard.press('ArrowLeft')
+    await page.keyboard.press('Escape')
+
+    await expect(mover).toBeFocused({ timeout: 5000 })
+    await mover.click()
+    await page.keyboard.press('ArrowLeft')
+    await page.keyboard.press('Enter')
+    await expect(tileOne.locator('..')).toHaveAttribute('data-workspace-slot', '1')
+    const rosterSource = page.getByRole('button', { name: `${U(1)} native workspace fixture 1`, exact: true }).first()
+    const rosterRect = await rosterSource.boundingBox()
+    const firstPane = await page.locator('[data-workspace-slot="0"]').boundingBox()
+    await page.mouse.move(rosterRect!.x + 12, rosterRect!.y + 8)
+    await page.mouse.down()
+    await page.mouse.move(firstPane!.x + 10, firstPane!.y + 80, { steps: 15 })
+    await expect(page.locator('.session-workspace-drop[data-edge="before"]')).toBeVisible()
+    await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-roster-edge.png') })
+    await page.mouse.up()
+    await expect(tileOne.locator('..')).toHaveAttribute('data-workspace-slot', '0')
+    const sash = page.getByRole('separator', { name: /Resize columns/ })
+    const sashBox = await sash.boundingBox()
+    const pointerBefore = Number(await sash.getAttribute('aria-valuenow'))
+    await page.mouse.move(sashBox!.x + 6, sashBox!.y + 80)
+    await page.mouse.down()
+    await page.mouse.move(sashBox!.x - 30, sashBox!.y + 80, { steps: 8 })
+    await page.mouse.up()
+    await expect.poll(async () => Number(await sash.getAttribute('aria-valuenow'))).toBeLessThan(pointerBefore)
+    const before = Number(await sash.getAttribute('aria-valuenow'))
+    await sash.focus()
+    await page.keyboard.press('ArrowLeft')
+    await expect.poll(async () => Number(await sash.getAttribute('aria-valuenow'))).toBeLessThan(before)
+    await page.getByRole('button', { name: 'Main + 2 side panes', exact: true }).click()
+    await expect(page.locator('.session-workspace-position:not([hidden]) > section.session-workspace-card[aria-label]')).toHaveCount(3)
+    await expect(page.locator('section.session-workspace-card[aria-label]')).toHaveCount(4)
+    await page.getByRole('navigation', { name: 'Open sessions' }).getByRole('button').nth(3).click()
+    await expect(tileFour).toBeVisible()
+    await page.getByRole('navigation', { name: 'Open sessions' }).getByRole('button').first().click()
+    expect(await transcript.evaluate(node => node.scrollTop)).toBe(100)
+    await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-1600x1000.png') })
+    await page.getByRole('button', { name: 'Focus', exact: true }).first().click()
+    await expect(page.locator('.session-workspace-position:not([hidden]) > section.session-workspace-card[aria-label]')).toHaveCount(1)
+    expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
+    await expect(draft).toContainText('日本語の下書き')
+    await page.getByRole('button', { name: 'Main + 2 side panes', exact: true }).click()
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    expect(await sash.evaluate(node => parseFloat(getComputedStyle(node, '::after').transitionDuration))).toBeLessThanOrEqual(.00001)
+    await page.setViewportSize({ width: 760, height: 1000 })
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+    await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-narrow.png') })
+    await page.setViewportSize({ width: 1600, height: 1000 })
+    await page.getByRole('button', { name: '2×2', exact: true }).click()
+    await expect(draft).toContainText('日本語の下書き')
+    expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
+    await expect(page.getByRole('main').getByRole('button', { name: 'New session', exact: true }).first()).toBeDisabled()
+    const fourth = page.locator('[data-workspace-slot="3"] section')
+    await fourth.locator('header button').last().click()
+    await page.getByRole('main').getByRole('button', { name: 'New session', exact: true }).first().click()
+    const createDialog = page.getByRole('dialog')
+    await expect(createDialog.getByRole('combobox', { name: 'Owner' })).toHaveValue(/default/)
+    await createDialog.getByRole('textbox').fill('Workspace native created')
+    await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-create.png') })
+    const createsBefore = ws.sent.filter(frame => frame.method === 'session.create').length
+    await createDialog.getByRole('button', { name: 'Create session', exact: true }).click()
+    await expect(createDialog).not.toBeVisible()
+    await expect.poll(() => ws!.sent.filter(frame => frame.method === 'session.create').length).toBe(createsBefore + 1)
+    const createdTile = page.locator('section.session-workspace-card').filter({ has: page.getByRole('heading', { name: 'Workspace native created', exact: true }) })
+    await expect(createdTile).toBeVisible()
+    await expect(createdTile.locator('[contenteditable="true"]').first()).toBeFocused()
+    await expect(draft).toContainText('日本語の下書き')
+    const arrangement = await page.locator('[data-workspace-slot]').evaluateAll(nodes => nodes.map(node => ({ index: node.getAttribute('data-workspace-slot'), id: node.querySelector('[data-workspace-session]')?.getAttribute('data-workspace-session') })).sort((a, b) => Number(a.index) - Number(b.index)))
+    const splitRatio = await sash.getAttribute('aria-valuenow')
+    await page.reload()
+    await waitForInteractive(app, page)
+    await page.getByRole('button', { name: 'Workspace', exact: true }).click()
+    await expect(page.locator('section.session-workspace-card[aria-label]')).toHaveCount(4)
+    expect(await page.locator('[data-workspace-slot]').evaluateAll(nodes => nodes.map(node => ({ index: node.getAttribute('data-workspace-slot'), id: node.querySelector('[data-workspace-session]')?.getAttribute('data-workspace-session') })).sort((a, b) => Number(a.index) - Number(b.index)))).toEqual(arrangement)
+    await expect(page.getByRole('separator', { name: /Resize columns/ })).toHaveAttribute('aria-valuenow', splitRatio!)
+    console.log('V2_NATIVE gestures=tile+roster-edge+keyboard escape=focus-return draft=retained preset=3-visible+4-reachable approvals=2-owner-runtime-scoped creation=production-contract new-composer=focused capacity=disabled narrow=no-document-overflow reduced-motion=reduce persistence=reload')
     console.log(
       `NATIVE_SESSION_WORKSPACE_SMOKE isolation=verified roster=4 tiles=4 ipc_api_paths=${new Set(apiPaths).size} ` +
         `gateway_ws=${ws.sockets.length} unique_initial_sessions=${new Set(initialRuntimeIds).size} ` +

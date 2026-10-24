@@ -78,7 +78,7 @@ function selectionOutsideComposer(): boolean {
 function focusSelectedComposer() {
   const owner = $floatingComposerOwner.get()
 
-  if (!owner || selectionOutsideComposer() || inFloatingLayer(document.activeElement)) {
+  if (!owner || selectionOutsideComposer() || inFloatingLayer(document.activeElement) || document.activeElement?.closest('[data-workspace-control]')) {
     return
   }
 
@@ -152,7 +152,7 @@ function trackPointer(event: PointerEvent) {
     keyboardNavigation = false
   }
 
-  if (!target || (event.type === 'pointermove' && event.buttons !== 0)) {
+  if (!target || target.closest('[data-workspace-control]') || (event.type === 'pointermove' && event.buttons !== 0)) {
     return
   }
 
@@ -190,7 +190,7 @@ function trackKey(event: KeyboardEvent) {
 function trackFocus(event: FocusEvent) {
   const target = event.target instanceof Element ? event.target : null
 
-  if (!target) {
+  if (!target || target.closest('[data-workspace-control]')) {
     return
   }
 

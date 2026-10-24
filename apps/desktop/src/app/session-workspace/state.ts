@@ -4,9 +4,20 @@ import type { PluginStorage } from '@/contrib/plugin'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { $sessionWorkspaceActive } from '@/store/session-workspace'
 
+import { DEFAULT_SPLITS, parseSplits, workspaceOwnerKey, type WorkspaceSplits } from './layout'
 import { addWorkspaceSession, sameWorkspaceSession, type WorkspaceSessionKey } from './model'
 
-export type WorkspaceLayout = 'focus' | 'grid'
+export type WorkspaceLayout = 'focus' | 'grid' | 'split'
+export const $sessionWorkspaceSplits = atom<WorkspaceSplits>(DEFAULT_SPLITS)
+let currentStorage: PluginStorage | undefined
+const ownerScope = () => JSON.stringify([...new Set($sessionWorkspaceSelection.get().map(key => workspaceOwnerKey(key.ownerRoute)))].sort())
+const splitKey = () => `splits.v2.${ownerScope()}`
+
+export function setSessionWorkspaceSplits(value: WorkspaceSplits): void {
+  $sessionWorkspaceSplits.set(parseSplits(value))
+
+  if (currentStorage) { write(currentStorage, splitKey(), $sessionWorkspaceSplits.get()) }
+}
 
 export const $sessionWorkspaceSelection = atom<WorkspaceSessionKey[]>([])
 export const $sessionWorkspaceLayout = atom<WorkspaceLayout>('grid')
@@ -74,15 +85,31 @@ let unbindCurrent: (() => void) | undefined
 export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void {
   unbindCurrent?.()
   $sessionWorkspaceActive.set(false)
-  $sessionWorkspaceSelection.set(parseSelection(read(storage, STORAGE_SELECTION, [])))
+  currentStorage = storage
+  const savedKey = read<string>(storage, 'arrangement.last.v2', 'arrangement.v2')
+  const saved = read<{ selection?: unknown; layout?: unknown; focused?: unknown } | null>(storage, typeof savedKey === 'string' && savedKey.startsWith('arrangement.') ? savedKey : 'arrangement.v2', null)
+  $sessionWorkspaceSelection.set(parseSelection(saved?.selection ?? read(storage, STORAGE_SELECTION, [])))
 
-  const savedLayout = read<unknown>(storage, STORAGE_LAYOUT, 'grid')
-  $sessionWorkspaceLayout.set(savedLayout === 'focus' ? 'focus' : 'grid')
-  $sessionWorkspaceFocused.set(parseKey(read(storage, STORAGE_FOCUS, null)))
+  const savedLayout = saved?.layout ?? read<unknown>(storage, STORAGE_LAYOUT, 'grid')
+  $sessionWorkspaceLayout.set(savedLayout === 'focus' || savedLayout === 'split' ? savedLayout : 'grid')
+  const restoredFocus = parseKey(saved?.focused ?? read(storage, STORAGE_FOCUS, null))
+  $sessionWorkspaceFocused.set($sessionWorkspaceSelection.get().find(key => restoredFocus && sameWorkspaceSession(key, restoredFocus)) ?? $sessionWorkspaceSelection.get()[0] ?? null)
+  $sessionWorkspaceSplits.set(parseSplits(read(storage, splitKey(), DEFAULT_SPLITS)))
 
-  const offSelection = $sessionWorkspaceSelection.listen(value => write(storage, STORAGE_SELECTION, value))
-  const offLayout = $sessionWorkspaceLayout.listen(value => write(storage, STORAGE_LAYOUT, value))
-  const offFocus = $sessionWorkspaceFocused.listen(value => write(storage, STORAGE_FOCUS, value))
+  const persist = () => {
+    const key = `arrangement.v2.${ownerScope()}`
+    write(storage, key, { selection: $sessionWorkspaceSelection.get(), layout: $sessionWorkspaceLayout.get(), focused: $sessionWorkspaceFocused.get() })
+    write(storage, 'arrangement.last.v2', key)
+  }
+
+  const offSelection = $sessionWorkspaceSelection.listen(() => {
+    $sessionWorkspaceSplits.set(parseSplits(read(storage, splitKey(), DEFAULT_SPLITS)))
+    persist()
+  })
+
+  const offLayout = $sessionWorkspaceLayout.listen(persist)
+  const offFocus = $sessionWorkspaceFocused.listen(persist)
+  persist()
 
   let disposed = false
 
@@ -94,7 +121,7 @@ export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void 
     offFocus()
     $sessionWorkspaceActive.set(false)
 
-    if (unbindCurrent === unbind) {unbindCurrent = undefined}
+    if (unbindCurrent === unbind) {unbindCurrent = undefined; currentStorage = undefined}
   }
 
   unbindCurrent = unbind

@@ -33,6 +33,7 @@
 
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
+import { WORKSPACE_DRAG_EVENT } from '@/app/session-workspace/board'
 import { queryAllVisible } from '@/components/pane-shell/pane-visibility'
 import {
   rectContains,
@@ -58,6 +59,7 @@ import { requestFreshSession } from '@/store/profile'
 import { moveSessionToProject, projectIdForCwd } from '@/store/projects'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
 import { $sessionTiles, nextSessionTileForWorkspace, openSessionTile, type TileDock } from '@/store/session-states'
+import { $sessionWorkspaceActive } from '@/store/session-workspace'
 
 import { requestComposerInsertRefs } from './composer/focus'
 import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './composer/inline-refs'
@@ -131,6 +133,12 @@ export function startSessionDrag(
   e: ReactPointerEvent<HTMLElement>,
   opts?: { onTap?: () => void }
 ) {
+  if ($sessionWorkspaceActive.get()) {
+    document.dispatchEvent(new CustomEvent(WORKSPACE_DRAG_EVENT, { detail: { id: payload.id, x: e.clientX, y: e.clientY, pointerId: e.pointerId, origin: e.currentTarget } }))
+
+    return
+  }
+
   let zones: EngineZone[] = []
   let strips: StripSnapshot[] = []
   let surfaces: SurfaceSnapshot[] = []

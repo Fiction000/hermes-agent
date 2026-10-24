@@ -31,6 +31,9 @@ import { $sessionTiles, knownOwnerForSession, openSessionTile, setSessionTileWor
 import { $sessionWorkspaceActive } from '@/store/session-workspace'
 import type { SessionInfo } from '@/types/hermes'
 
+import { WorkspaceBoard } from './board'
+import { WorkspaceCreateDialog } from './create'
+import { placeWorkspaceSession } from './layout'
 import {
   addWorkspaceSession,
   sameWorkspaceSession,
@@ -105,6 +108,7 @@ function titleFor(row: SessionInfo): string {
 function WorkspaceSlot({
   onRemove,
   onShowPicker,
+  onCreate,
   route,
   session,
   title,
@@ -114,6 +118,7 @@ function WorkspaceSlot({
 }: {
   onRemove?: () => void
   onShowPicker: () => void
+  onCreate: () => void
   route?: SessionOwnerRoute
   session?: WorkspaceSessionKey
   title?: string
@@ -142,6 +147,7 @@ function WorkspaceSlot({
             {t('page.addSession')}
           </Button>
         )}
+        {!session ? <Button onClick={onCreate} size="sm" variant="ghost">{t('page.newSession')}</Button> : null}
       </div>
     )
   }
@@ -152,8 +158,9 @@ function WorkspaceSlot({
     <section
       aria-label={visibleTitle}
       className="session-workspace-card flex min-h-[17rem] min-w-0 flex-col overflow-hidden rounded-[0.625rem] border border-(--ui-stroke-secondary) bg-(--ui-bg-chrome)"
+      data-workspace-session={session.storedSessionId}
     >
-      <header className="flex min-w-0 items-center justify-between gap-3 border-b border-(--ui-stroke-secondary) px-3.5 py-2.5">
+      <header className="flex min-w-0 items-center justify-between gap-3 border-b border-(--ui-stroke-secondary) px-3.5 py-2.5" data-workspace-control>
         <div className="flex min-w-0 items-center gap-2">
           <SessionStatusDot className="shrink-0" session={undefined} storedSessionId={session.storedSessionId} />
           <h2 className="truncate text-sm font-semibold text-(--ui-text-primary)" title={visibleTitle}>
@@ -184,7 +191,6 @@ function WorkspaceSlot({
             aria-label={t('page.remove', visibleTitle)}
             onClick={onRemove}
             size="icon-xs"
-            title={t('page.remove', visibleTitle)}
             type="button"
             variant="ghost"
           >
@@ -214,6 +220,7 @@ export function SessionWorkspacePage() {
   const focused = useStore($sessionWorkspaceFocused)
   const mainSessionId = useStore($selectedStoredSessionId)
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
   const [search, setSearch] = useState('')
 
   // Hide the legacy tile pane contributions before mounting their replacement
@@ -270,14 +277,14 @@ export function SessionWorkspacePage() {
     setSessionWorkspaceLayout(next)
   }
 
-  function addSession(candidate: WorkspaceRow) {
+  function addSession(candidate: WorkspaceRow, position?: number) {
     const ownerRoute = candidate.ownerRoute
 
     if (!ownerRoute) {return}
 
     const key: WorkspaceSessionKey = { storedSessionId: candidate.row.id, ownerRoute }
     const current = $sessionWorkspaceSelection.get()
-    const next = addWorkspaceSession(current, key)
+    const next = position === undefined ? addWorkspaceSession(current, key) : placeWorkspaceSession(current, key, position)
 
     if (next.length === current.length && !current.some(item => sameWorkspaceSession(item, key))) {return}
 
@@ -341,7 +348,7 @@ export function SessionWorkspacePage() {
 
   const renderSlot = (key: WorkspaceSessionKey | null, index: number) => {
     if (!key) {
-      return <WorkspaceSlot key={`empty-${index}`} onShowPicker={openPicker} t={t} />
+      return <WorkspaceSlot key={`empty-${index}`} onCreate={() => setCreateOpen(true)} onShowPicker={openPicker} t={t} />
     }
 
     const tile = tileFor(key)
@@ -352,11 +359,12 @@ export function SessionWorkspacePage() {
       <WorkspaceSlot
         key={identityKey(key.storedSessionId, key.ownerRoute)}
         missing={!tile}
+        onCreate={() => setCreateOpen(true)}
         onRemove={() => removeSession(key)}
         onShowPicker={openPicker}
         route={key.ownerRoute}
         session={key}
-        showFocus={layout === 'grid'}
+        showFocus={layout !== 'focus'}
         t={t}
         title={title}
       />
@@ -368,13 +376,14 @@ export function SessionWorkspacePage() {
   }
 
   return (
-    <main className="flex h-full min-h-0 min-w-0 flex-col gap-3 overflow-hidden p-4 xl:gap-4 xl:p-5">
-      <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-6 gap-y-3">
+    <main className="session-workspace-root flex h-full min-h-0 min-w-0 flex-col gap-3 overflow-hidden p-4 xl:gap-4 xl:p-5">
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-6 gap-y-3" data-workspace-control>
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight text-(--ui-text-primary)">{t('page.title')}</h1>
           <p className="mt-0.5 text-xs text-(--ui-text-tertiary)">{t('page.selectedCount', selected.length, WORKSPACE_MAX_SESSIONS)}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <Button disabled={selected.length >= WORKSPACE_MAX_SESSIONS} onClick={() => setCreateOpen(true)} size="sm" variant="outline">{t('page.newSession')}</Button>
           <Button onClick={openPicker} size="sm" type="button" variant="default">
             <span aria-hidden>＋</span>
             {t('page.addSession')}
@@ -399,6 +408,7 @@ export function SessionWorkspacePage() {
             >
               {t('page.focus')}
             </Button>
+            <Button aria-pressed={layout === 'split'} onClick={() => changeLayout('split')} size="sm" variant={layout === 'split' ? 'secondary' : 'ghost'}>{t('page.split')}</Button>
           </div>
         </div>
       </header>
@@ -421,13 +431,22 @@ export function SessionWorkspacePage() {
           </div>
         </section>
       ) : (
-        <div className={`session-workspace-grid grid min-h-0 flex-1 gap-3 overflow-y-auto pr-1 xl:overflow-hidden ${layout === 'grid' ? 'grid-cols-1 auto-rows-[minmax(17rem,auto)] xl:grid-cols-2 xl:grid-rows-[repeat(2,minmax(0,1fr))] xl:auto-rows-auto' : 'grid-cols-1 grid-rows-1'}`}>
-          {layout === 'grid'
-            ? Array.from({ length: WORKSPACE_MAX_SESSIONS }, (_, index) => renderSlot(selected[index] ?? null, index))
-            : renderSlot(focusedKey, 0)}
-        </div>
+        <WorkspaceBoard focused={focusedKey} layout={layout} onFocus={setSessionWorkspaceFocused} onPlace={(key, position) => {
+          const candidate = rowForKey(key)
+
+          if (selected.some(item => sameWorkspaceSession(item, key))) { setSessionWorkspaceSelection(placeWorkspaceSession(selected, key, position)) }
+          else if (candidate && !canOpen(candidate).disabled) { addSession(candidate, position) }
+        }} renderSlot={renderSlot} resolveDragged={id => {
+          const candidates = rows.filter(candidate => candidate.row.id === id)
+          const candidate = candidates.length === 1 ? candidates[0] : undefined
+
+          return candidate?.ownerRoute ? { storedSessionId: id, ownerRoute: candidate.ownerRoute } : null
+        }} selected={selected} sessionLabel={key => { const row = rowForKey(key);
+
+ return row ? titleFor(row.row) : key.storedSessionId }} />
       )}
 
+      <WorkspaceCreateDialog onOpenChange={setCreateOpen} open={createOpen} />
       <Dialog
         onOpenChange={open => {
           setPickerOpen(open)
@@ -474,7 +493,6 @@ export function SessionWorkspacePage() {
                         className="flex w-full min-w-0 items-center gap-3 px-4 py-3 text-left outline-none transition-colors hover:bg-(--chrome-action-hover) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-default disabled:opacity-55"
                         disabled={disabled}
                         onClick={() => addSession(candidate)}
-                        title={candidate.ownerRoute ? `${candidate.ownerRoute.profile} · ${candidate.ownerRoute.connectionId}` : t('picker.ownerUnavailable')}
                         type="button"
                       >
                         <SessionStatusDot className="shrink-0" session={candidate.row} storedSessionId={candidate.row.id} />
