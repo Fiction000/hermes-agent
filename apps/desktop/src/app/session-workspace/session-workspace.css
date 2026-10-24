@@ -1,0 +1,19 @@
+.session-workspace-grid {
+  scrollbar-gutter: stable;
+}
+
+.session-workspace-card:focus-within {
+  border-color: color-mix(in srgb, var(--ui-accent) 58%, var(--ui-stroke-secondary));
+}
+
+.session-workspace-status {
+  max-width: 10rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-workspace-grid,
+  .session-workspace-card {
+    scroll-behavior: auto;
+    transition: none;
+  }
+}

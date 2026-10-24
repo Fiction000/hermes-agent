@@ -71,6 +71,7 @@ import {
   type SessionTile,
   sessionTileDelegate
 } from '@/store/session-states'
+import { $sessionWorkspaceActive } from '@/store/session-workspace'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionDragPayload } from './composer/inline-refs'
@@ -951,7 +952,11 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
 /** Keep pane contributions mirroring `$sessionTiles` (+ titles from
  *  `$sessions`). Tiles dock against main on the chosen edge, flex width. */
 export const watchSessionTiles = paneMirror<SessionTile>({
-  source: $sessionTiles,
+  // The opt-in workspace reuses the same SessionTilePane components in its own
+  // 2×2/focus composition. Remove the old pane contributions while that page is
+  // mounted so each stored session has exactly one live composer surface. The
+  // tile/session stores remain untouched; leaving the route re-registers them.
+  source: computed([$sessionTiles, $sessionWorkspaceActive], (tiles, active) => active ? [] : tiles),
   // $projectTree: a tile whose session is older than the recents page resolves
   // its title through the tree, which loads after the tiles register.
   // $cronSessions/$messagingSessions: `tileStoredRow` reads every sidebar
