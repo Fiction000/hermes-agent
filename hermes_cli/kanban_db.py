@@ -1232,6 +1232,12 @@ def create_task(
         if row:
             return row["id"]
 
+    from hermes_cli.kanban_db_assignments import create_task_assignment
+    assignment = create_task_assignment(
+        assignee, title=title, body=body, workspace_kind=workspace_kind,
+    )
+    assignee = assignment.resolved
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1301,6 +1307,7 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                _append_assignment_routed_event(conn, task_id, assignment)
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -1451,36 +1458,29 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _assignment_decision(conn: sqlite3.Connection, task_id: str, profile: Optional[str]):
+    from hermes_cli.kanban_db_assignments import assignment_decision
+
+    return assignment_decision(conn, task_id, profile)
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
-    profile = _canonical_assignee(profile)
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
-            return False
-        if row["claim_lock"] is not None and row["status"] == "running":
-            raise RuntimeError(
-                f"cannot reassign {task_id}: currently running (claimed). "
-                "Wait for completion or reclaim the stale lock first."
-            )
-        if row["assignee"] != profile:
-            # The failure streak is per task/profile; a new profile starts fresh.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?", (profile, task_id),
-            )
-        else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
-        )
-    # Observer fires AFTER commit so subscribers see durable state.
-    notify_task_updated(conn, task_id, ("assignee",))
-    return True
+    from hermes_cli.kanban_db_assignments import assign_task as _assign_task
+
+    return _assign_task(conn, task_id, profile)
+
+
+def _assign_task_decided(conn: sqlite3.Connection, task_id: str, assignment) -> bool:
+    from hermes_cli.kanban_db_assignments import assign_task_decided
+
+    return assign_task_decided(conn, task_id, assignment)
+
+
+def _append_assignment_routed_event(conn: sqlite3.Connection, task_id: str, assignment) -> None:
+    from hermes_cli.kanban_db_assignments import append_assignment_routed_event
+
+    append_assignment_routed_event(conn, task_id, assignment)
 
 
 def set_model_override(
@@ -2511,18 +2511,10 @@ def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
     reason: Optional[str] = None,
 ) -> bool:
-    """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
-    if reclaim_first:
-        # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
-    # assign_task handles its own txn + the still-running guard.
-    try:
-        return assign_task(conn, task_id, profile)
-    except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
-        # needs to decide whether to retry with reclaim.
-        return False
+    """Reassign (None unassigns), optionally reclaiming a running task first."""
+    from hermes_cli.kanban_db_assignments import reassign_task as _reassign_task
+
+    return _reassign_task(conn, task_id, profile, reclaim_first=reclaim_first, reason=reason)
 
 
 def _verify_created_cards(
@@ -3301,7 +3293,7 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, title, body, workspace_kind FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
@@ -3323,6 +3315,16 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            review_decision = None
+            if reviewer is not None:
+                from hermes_cli.kanban_db_assignments import resolve_task_assignment
+                review_decision = resolve_task_assignment(
+                    reviewer, title=trow["title"], body=trow["body"],
+                    workspace_kind=trow["workspace_kind"], operation="request_review",
+                )
+                if review_decision.resolved is None:
+                    return _ret(False, review_decision.reason)
+                reviewer = review_decision.resolved
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -3381,6 +3383,8 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+            if review_decision is not None:
+                _append_assignment_routed_event(conn, task_id, review_decision)
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
@@ -3420,7 +3424,7 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, current_run_id, title, body, workspace_kind FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if task_row is None:
             return False, "task not found"
@@ -3441,6 +3445,14 @@ def request_changes(
         implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
+        from hermes_cli.kanban_db_assignments import resolve_task_assignment
+        decision = resolve_task_assignment(
+            implementer, title=task_row["title"], body=task_row["body"],
+            workspace_kind=task_row["workspace_kind"],
+        )
+        if decision.resolved is None:
+            return False, decision.reason
+        implementer = decision.resolved
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
@@ -3475,6 +3487,7 @@ def request_changes(
             },
             run_id=run_id,
         )
+        _append_assignment_routed_event(conn, task_id, decision)
     return True, implementer
 
 
@@ -3608,14 +3621,28 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     not a block; only :func:`complete_task` clears them)."""
     now = int(time.time())
     with write_txn(conn):
+        review_event = _latest_event(conn, task_id, "review_requested")
+        handoff = _json_dict(_row_get(review_event, "payload"))
+        implementer = _nonblank_str(handoff.get("implementer"))
+        decision = None
+        if implementer:
+            task = conn.execute(
+                "SELECT title, body, workspace_kind FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if task is not None:
+                from hermes_cli.kanban_db_assignments import resolve_task_assignment
+                decision = resolve_task_assignment(
+                    implementer, title=task["title"], body=task["body"],
+                    workspace_kind=task["workspace_kind"],
+                )
+                if decision.resolved is None:
+                    return False
+                implementer = decision.resolved
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
-        review_event = _latest_event(conn, task_id, "review_requested")
-        handoff = _json_dict(_row_get(review_event, "payload"))
-        implementer = _nonblank_str(handoff.get("implementer"))
         params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
@@ -3634,6 +3661,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
+        if decision is not None:
+            _append_assignment_routed_event(conn, task_id, decision)
         return True
 
 
@@ -3736,57 +3765,12 @@ def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
-    if title is not None and not title.strip():
-        raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
-        existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
-            (task_id,),
-        ).fetchone()
-        if existing is None:
-            return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
-        changed_fields: list[str] = []
-        if title is not None and title.strip() != (existing["title"] or ""):
-            sets.append("title = ?")
-            params.append(title.strip())
-            changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
-            sets.append("assignee = ?")
-            params.append(assignee)
-            changed_fields.append("assignee")
-        params.append(task_id)
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
-        )
-        if cur.rowcount != 1:
-            return False
-        if changed_fields and author and author.strip():
-            # Not add_comment (own txn + 'commented' event); 'specified' below records it.
-            _insert_comment(
-                conn, task_id, author.strip(),
-                "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
-                int(time.time()),
-            )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
-    # Own IMMEDIATE txn (outside the one above): a parent-free specified task
-    # flips to 'ready' now instead of idling until the next tick.
-    recompute_ready(conn)
-    return True
+    """Update triage task content/assignment and promote it to todo."""
+    from hermes_cli.kanban_db_assignments import specify_triage_task_impl
+
+    return specify_triage_task_impl(
+        conn, task_id, title=title, body=body, assignee=assignee, author=author,
+    )
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:

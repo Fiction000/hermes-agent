@@ -106,20 +106,31 @@ def decompose_triage_task(
 
     if not children:
         return None
+    children = [dict(child) for child in children]
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     _validate_children_graph(children)
+    from hermes_cli.kanban_capabilities import resolve_assignment
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, title, body "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        root_decision = None
+        if root_assignee is not None:
+            root_decision = resolve_assignment(
+                root_assignee, title=root_row["title"], body=root_row["body"],
+                workspace_kind=root_row["workspace_kind"] or "scratch", operation="execute",
+            )
+            if root_decision.resolved is None:
+                raise ValueError(root_decision.reason)
+            root_assignee = root_decision.resolved
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
         if conn.execute(
@@ -127,6 +138,19 @@ def decompose_triage_task(
             (task_id,),
         ).fetchone():
             return None
+        # Check the effective inherited workspace in the same transaction as
+        # insertion. No child is inserted until every assignment has passed.
+        for child in children:
+            requested = _canonical_assignee(child.get("assignee"))
+            child["workspace_kind"] = child.get("workspace_kind") or root_row["workspace_kind"] or "scratch"
+            decision = resolve_assignment(
+                requested, title=child["title"], body=child.get("body"),
+                workspace_kind=child["workspace_kind"], operation="execute",
+            )
+            if requested is not None and decision.resolved is None:
+                raise ValueError(decision.reason)
+            child["assignee"] = decision.resolved
+            child["_assignment_decision"] = decision
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
             for child in children
@@ -159,6 +183,12 @@ def decompose_triage_task(
         _append_event(
             conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
         )
+        if root_decision is not None:
+            _append_event(conn, task_id, "assignment_routed", {
+                "requested": root_decision.requested, "resolved": root_decision.resolved,
+                "required": list(root_decision.required), "missing": list(root_decision.missing),
+                "reason": root_decision.reason,
+            })
     # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
     # children in ``todo`` for manual-review-first workflows.
     if auto_promote:
@@ -210,5 +240,12 @@ def _insert_decomposed_child(
     _append_event(
         conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
     )
+    decision = child.get("_assignment_decision")
+    if decision is not None:
+        _append_event(conn, new_id, "assignment_routed", {
+            "requested": decision.requested, "resolved": decision.resolved,
+            "required": list(decision.required), "missing": list(decision.missing),
+            "reason": decision.reason,
+        })
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

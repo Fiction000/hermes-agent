@@ -5,6 +5,37 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_kanban_profiles(tmp_path_factory, monkeypatch, request):
+    """Use real isolated profile configs for legacy opaque assignee labels."""
+    if not request.path.name.startswith("test_kanban_") or request.path.name == "test_kanban_capabilities.py":
+        return
+    root = tmp_path_factory.mktemp("synthetic-hermes") / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    labels = {"default", "a", "b", "alpha", "beta", "alice", "bob", "broken", "builder", "coder",
+              "demo", "designer", "dev", "elias", "engineer", "ops", "orch", "baxter",
+              "orchestrator", "planner", "release", "reviewer", "reviewer-a", "setup", "some-profile",
+              "someother", "teknium", "w", "w1", "worker", "worker-a", "worker1", "writer", "zdr", "triage",
+              "researcher", "researcher-a", "researcher-b", "verifier", "synthesizer", "docs", "fallback", "lead-reviewer"}
+    from hermes_cli import kanban_capabilities as cap
+    original = cap._home
+
+    def synthetic_home(profile):
+        # Modules may replace HERMES_HOME after autouse fixture setup or use
+        # connect()'s schema initializer. Materialize their explicit test profile
+        # at first read, then run the real config/SOUL capability gate unchanged.
+        home = original(profile)
+        assert home.is_relative_to(tmp_path_factory.getbasetemp())
+        if profile in labels:
+            home.mkdir(parents=True, exist_ok=True)
+            config = home / "config.yaml"
+            if not config.exists():
+                config.write_text("platform_toolsets:\n  cli: [terminal, file, browser]\n", encoding="utf-8")
+        return home
+
+    monkeypatch.setattr(cap, "_home", synthetic_home)
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

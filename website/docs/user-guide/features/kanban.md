@@ -1464,6 +1464,30 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
+## Capability-aware assignment
+
+Kanban checks the target profile's saved CLI tool selection, disabled toolsets, configured MCP servers, and `SOUL.md` at its database assignment boundaries. Creation, auto-decomposition, specification, reassignment, review handoff/return, and the dispatcher's default assignment share this preflight. A missing capability routes to `default` only if that profile passes the same check. Otherwise the operation is refused with a reason. An omitted assignee remains unassigned.
+
+The gate reads profile files without switching profiles, loading credentials, starting MCP servers, or granting tools. Managed configuration is overlaid read-only. Missing/unreadable/malformed config and unresolved capability-policy variables fail closed. Runtime tool selection, credentials, approval requirements, and security restrictions still apply.
+
+Requirements use bounded English/Japanese action cues, including implementation/build/test commands, worktrees, live-browser QA, and writing. This is not general semantic NLP. Add explicit requirements when the wording is ambiguous:
+
+```text
+kanban-capabilities: terminal,file_write,browser,mcp:records
+```
+
+Allowed values are `terminal`, `file_write`, `browser`, and `mcp:<server-name>`. Declarations **add to** inferred requirements. Named phrases such as `Figma MCP` infer `mcp:figma`; ambiguous MCP work needs an explicit server declaration. No role-name map is used.
+
+The MCP check establishes configured, enabled, CLI-selected server access, including disabled/empty-include filters. It does not establish live connectivity, successful authentication, or the existence of an individual tool. Those remain worker/runtime checks. Use specific task acceptance criteria for tool-level contracts.
+
+`SOUL.md` has bounded English/Japanese prohibition matching (for example, `No terminal`, `Do not use the terminal`, or `ターミナルは禁止`). Arbitrary policy prose cannot be interpreted completely. For an unambiguous additional denial, use a SOUL line:
+
+```text
+kanban-deny-capabilities: terminal,browser
+```
+
+Denials only subtract from configured capabilities. A source/prose review does not inherit implementation terminal/worktree requirements; explicit declarations and live-browser requirements still apply. Successful assignments record `assignment_routed` with requested/resolved profiles, required/missing capabilities, and a reason. Rejected dispatcher defaults leave an `assignment_rejected` event and do not claim or spawn the card. Other rejected writes return an error/reason without committing the assignment.
+
 ## Out of scope
 
 Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.

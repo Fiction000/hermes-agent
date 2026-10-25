@@ -223,7 +223,11 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
     monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))  # any gh spawn would fail as infra
     kb.init_db()
     with connect() as conn:
-        tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost")
+        tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="default")
+        # Simulate an existing assignee being deleted after its assignment.
+        # New assignments to nonexistent profiles are now routed/rejected.
+        conn.execute("UPDATE tasks SET assignee='ghost' WHERE id=?", (tid,))
+        conn.commit()
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(

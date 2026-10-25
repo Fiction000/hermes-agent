@@ -335,6 +335,17 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
     env["PYTHONPATH"] = str(_WORKTREE)
     if env_extra:
         env.update(env_extra)
+    # CLI integration tests run outside pytest's in-process compatibility fixture.
+    # Give the opaque fake assignee a minimal, explicit profile config rather than
+    # teaching production routing to accept missing profiles.
+    if "--assignee" in args and env.get("HERMES_HOME"):
+        assignee = args[args.index("--assignee") + 1]
+        profiles = Path(env["HERMES_HOME"]) / "profiles"
+        for profile_home in (Path(env["HERMES_HOME"]), profiles / assignee):
+            profile_home.mkdir(parents=True, exist_ok=True)
+            (profile_home / "config.yaml").write_text(
+                "platform_toolsets:\n  cli: [file, terminal, browser]\n", encoding="utf-8",
+            )
     return subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "kanban"] + args,
         env=env,

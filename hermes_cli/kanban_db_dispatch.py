@@ -2179,33 +2179,10 @@ def _dispatch_lane_task(
 
 def _apply_default_assignee(
     conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
-) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
+) -> Optional[str]:
+    from hermes_cli.kanban_db_assignments import apply_default_assignee
 
-    Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
-    """
-    if dry_run:
-        return True
-    try:
-        with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
-            )
-    except Exception:
-        _kb._log.debug(
-            "kanban dispatch: failed to apply default_assignee=%r to task %s",
-            assignee, task_id, exc_info=True,
-        )
-        return False
-    return True
+    return apply_default_assignee(conn, task_id, assignee, dry_run=dry_run)
 
 
 def _run_reclaim_phase(
@@ -2432,12 +2409,13 @@ def _dispatch_once_locked(
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
             # park in 'ready' forever.
-            if not default_assignee or not _apply_default_assignee(
+            routed_assignee = _apply_default_assignee(
                 conn, row["id"], default_assignee, dry_run=dry_run,
-            ):
+            ) if default_assignee else None
+            if not routed_assignee:
                 result.skipped_unassigned.append(row["id"])
                 continue
-            row_assignee = default_assignee
+            row_assignee = routed_assignee
             result.auto_assigned_default.append(row["id"])
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1

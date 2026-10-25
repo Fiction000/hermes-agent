@@ -696,6 +696,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    # This argv/env test does not need a real install/payload manifest lookup.
+    # Keep it isolated when the checkout itself lives under a real Hermes home.
+    monkeypatch.setattr("tools.environments.local._resolve_hermes_bin_dir", lambda: None)
 
     conn = kbc.connect()
     try:
