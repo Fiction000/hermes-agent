@@ -420,6 +420,67 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     await page.getByRole('navigation', { name: 'Open sessions' }).getByRole('button').first().click()
     expect(await transcript.evaluate(node => node.scrollTop)).toBe(100)
     await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-1600x1000.png') })
+    const readability = []
+
+    for (const width of [1600, 760]) {
+      await page.setViewportSize({ width, height: 1000 })
+
+      for (const colorScheme of ['light', 'dark'] as const) {
+        await page.emulateMedia({ colorScheme })
+        await expect(page.locator('html')).toHaveAttribute('data-hermes-mode', colorScheme)
+
+        for (const focused of [true, false]) {
+          await draft.click()
+          await transcript.evaluate(async node => {
+            node.scrollTop = 101
+            await new Promise(requestAnimationFrame)
+            node.scrollTop = 100
+            node.dispatchEvent(new Event('scroll'))
+          })
+
+          if (!focused) {
+            await page.getByRole('heading', { name: 'Workspace', exact: true }).click()
+            await page.mouse.move(10, 10)
+          }
+
+          await expect.poll(() => transcript.evaluate(node => node.scrollTop)).toBe(100)
+          await expect(tileOne.locator('[data-slot="composer-root"]')).toHaveAttribute('data-thread-scrolled-up', '')
+          await expect.poll(() => tileOne.locator('[data-slot="composer-fade"]').evaluate(async node => {
+            await Promise.all(node.getAnimations().map(animation => animation.finished))
+            return true
+          })).toBe(true)
+          const metrics = await tileOne.evaluate(node => {
+            const fade = node.querySelector('[data-slot="composer-fade"]')!
+            const surface = node.querySelector('[data-slot="composer-surface"]')!
+            const root = node.querySelector('[data-slot="composer-root"]')!
+            const input = node.querySelector('[contenteditable="true"]')!
+            const background = getComputedStyle(surface.firstElementChild!).backgroundColor
+            const context = document.createElement('canvas').getContext('2d')!
+            context.fillStyle = background
+            context.fillRect(0, 0, 1, 1)
+            return {
+              opacity: getComputedStyle(fade).opacity,
+              background,
+              backgroundAlpha: context.getImageData(0, 0, 1, 1).data[3],
+              fill: getComputedStyle(root).getPropertyValue('--composer-fill'),
+              scrolledUp: root.hasAttribute('data-thread-scrolled-up'),
+              focused: input === document.activeElement || input.contains(document.activeElement),
+              draft: input.textContent,
+              inputColor: getComputedStyle(input).color,
+              controlColor: getComputedStyle(fade.querySelector('button')!).color
+            }
+          })
+          readability.push({ width, colorScheme, requestedFocus: focused, ...metrics })
+          await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, `q1-${width}-${colorScheme}-${focused ? 'focused' : 'blurred'}.png`) })
+          expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
+          await expect(draft).toHaveText('日本語の下書き。移動しても保持する。')
+        }
+      }
+    }
+
+    fs.writeFileSync(path.join(process.env.HERMES_E2E_CORE_ROOT!, 'q1-readability.json'), JSON.stringify(readability, null, 2))
+    await page.setViewportSize({ width: 1600, height: 1000 })
+    await page.emulateMedia({ colorScheme: 'light' })
     await page.getByRole('button', { name: 'Focus', exact: true }).first().click()
     await expect(page.locator('.session-workspace-position:not([hidden]) > section.session-workspace-card[aria-label]')).toHaveCount(1)
     expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
@@ -429,6 +490,21 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     expect(await sash.evaluate(node => parseFloat(getComputedStyle(node, '::after').transitionDuration))).toBeLessThanOrEqual(.00001)
     await page.setViewportSize({ width: 760, height: 1000 })
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+    const visualOrder = await page.locator('.session-workspace-position:not([hidden])').evaluateAll(nodes => nodes.map(node => ({ slot: node.getAttribute('data-workspace-slot')!, top: node.getBoundingClientRect().top })).sort((a, b) => a.top - b.top))
+    const lowest = page.locator(`[data-workspace-slot="${visualOrder.at(-1)!.slot}"]`)
+    await lowest.scrollIntoViewIfNeeded()
+    const lowestComposer = lowest.locator('[contenteditable="true"]').first()
+    await expect(lowestComposer).toBeInViewport()
+    const reachable = await lowestComposer.evaluate(node => {
+      const box = node.getBoundingClientRect()
+      const board = node.closest('.session-workspace-board')!.getBoundingClientRect()
+      const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+      return { top: box.top, bottom: box.bottom, boardTop: board.top, boardBottom: board.bottom, hit: node === hit || node.contains(hit) }
+    })
+    expect(reachable.top).toBeGreaterThanOrEqual(reachable.boardTop)
+    expect(reachable.bottom).toBeLessThanOrEqual(reachable.boardBottom)
+    expect(reachable.hit).toBe(true)
+    fs.writeFileSync(path.join(process.env.HERMES_E2E_CORE_ROOT!, 'narrow-lowest.json'), JSON.stringify({ visualOrder, reachable }, null, 2))
     await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, 'v2-native-narrow.png') })
     await page.setViewportSize({ width: 1600, height: 1000 })
     await page.getByRole('button', { name: '2×2', exact: true }).click()
@@ -458,6 +534,12 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     await expect(page.locator('section.session-workspace-card[aria-label]')).toHaveCount(4)
     expect(await page.locator('[data-workspace-slot]').evaluateAll(nodes => nodes.map(node => ({ index: node.getAttribute('data-workspace-slot'), id: node.querySelector('[data-workspace-session]')?.getAttribute('data-workspace-session') })).sort((a, b) => Number(a.index) - Number(b.index)))).toEqual(arrangement)
     await expect(page.getByRole('separator', { name: /Resize columns/ })).toHaveAttribute('aria-valuenow', splitRatio!)
+    for (const sample of readability) {
+      expect.soft(sample.focused, JSON.stringify(sample)).toBe(sample.requestedFocus)
+      expect.soft(sample.scrolledUp, JSON.stringify(sample)).toBe(true)
+      expect.soft(sample.opacity, JSON.stringify(sample)).toBe('1')
+      expect.soft(sample.backgroundAlpha, JSON.stringify(sample)).toBe(255)
+    }
     console.log('V2_NATIVE gestures=tile+roster-edge+keyboard escape=focus-return draft=retained preset=3-visible+4-reachable approvals=2-owner-runtime-scoped creation=production-contract new-composer=focused capacity=disabled narrow=no-document-overflow reduced-motion=reduce persistence=reload')
     console.log(
       `NATIVE_SESSION_WORKSPACE_SMOKE isolation=verified roster=4 tiles=4 ipc_api_paths=${new Set(apiPaths).size} ` +
