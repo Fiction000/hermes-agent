@@ -87,6 +87,21 @@ export function selectedWorkspaceTiles(
   })
 }
 
+export function workspaceSessionsToRestore(
+  selected: readonly WorkspaceSessionKey[],
+  available: readonly WorkspaceSessionKey[],
+  tiles: readonly SessionTile[],
+  blockedStoredSessionIds: ReadonlySet<string>
+): WorkspaceSessionKey[] {
+  const existingIds = new Set(tiles.map(tile => tile.storedSessionId))
+
+  return selected.filter(key =>
+    available.some(candidate => sameWorkspaceSession(candidate, key)) &&
+    !existingIds.has(key.storedSessionId) &&
+    !blockedStoredSessionIds.has(key.storedSessionId)
+  )
+}
+
 export function workspaceTileScope(key: WorkspaceSessionKey): SessionTileWorkspaceScope {
   return {
     ownerProfile: key.ownerRoute.profile,

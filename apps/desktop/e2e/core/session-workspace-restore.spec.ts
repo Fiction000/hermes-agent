@@ -17,11 +17,13 @@ test('saved four-pane selection survives restart, settings revisit and plugin re
   const sandbox = createCoreSandbox('workspace-restore')
   writeProviderHome(sandbox.hermesHome, provider.url)
   const ids = Array.from({ length: 4 }, (_, i) => `workspace-restore-${i + 1}`)
+
   // Same persisted shape as the closed production snapshot: four valid owner
   // keys, while the ordinary tile bucket contains unrelated, ownerless tabs.
   const selected = ids.map((storedSessionId, i) => ({ storedSessionId, ownerRoute: {
     connectionId: 'local', profile: 'default', ...(i ? { targetProfile: 'default' } : {})
   } }))
+
   const script = [
     'import sys', 'from pathlib import Path', 'from hermes_state import SessionDB',
     "db = SessionDB(db_path=Path(sys.argv[1]) / 'state.db')",
@@ -29,10 +31,12 @@ test('saved four-pane selection survives restart, settings revisit and plugin re
     "    db.append_message(sid, role='user', content=f'Synthetic question {sid}')",
     "    db.append_message(sid, role='assistant', content=f'Synthetic saved answer {sid}')", 'db.close()'
   ].join('\n')
+
   execFileSync(process.env.HERMES_E2E_PYTHON ?? 'python3', ['-c', script, sandbox.hermesHome, ...ids], {
     cwd: path.resolve(process.cwd(), '../..'), env: { ...process.env, HERMES_HOME: sandbox.hermesHome }
   })
   let app: ElectronApplication | undefined
+
   try {
     let launched = await launchCoreApp(coreAppEnv(sandbox))
     app = launched.app
@@ -63,31 +67,44 @@ test('saved four-pane selection survives restart, settings revisit and plugin re
     // Do route and plugin lifecycle checks even when tiles cannot restore, so a
     // second loss of selection is distinguished from missing tile bindings.
     await page.evaluate(() => { location.hash = '#/settings' })
+    await expect(page.locator('[data-overlay-surface]')).toBeVisible()
+    await expect(page).toHaveURL(/#\/settings/)
     await page.evaluate(() => { location.hash = '#/session-workspace' })
     await expect(page.getByText('4 / 4 sessions', { exact: true })).toBeVisible()
-    await page.evaluate(() => { location.hash = '#/capabilities?tab=plugins' })
-    await page.locator('[data-catalog-filters]').getByRole('button', { name: /Filters/ }).click()
-    await page.locator('[data-catalog-expanded-filters]').getByRole('button', { name: 'Installed' }).click()
-    const toggle = page.getByRole('switch', { name: 'Session Workspace' })
-    await expect(toggle).toHaveAttribute('aria-checked', 'true')
-    await toggle.click()
-    await expect(toggle).toHaveAttribute('aria-checked', 'false')
-    await toggle.click()
-    await expect(toggle).toHaveAttribute('aria-checked', 'true')
-    await page.evaluate(() => { location.hash = '#/session-workspace' })
-    await expect(page.getByText('4 / 4 sessions', { exact: true })).toBeVisible()
+
+    const rebindWorkspace = async () => {
+      await page.evaluate(() => { location.hash = '#/capabilities?tab=plugins' })
+      await page.locator('[data-catalog-filters]').getByRole('button', { name: /Filters/ }).click()
+      await page.locator('[data-catalog-expanded-filters]').getByRole('button', { name: 'Installed' }).click()
+      const toggle = page.getByRole('switch', { name: 'Session Workspace' })
+      await expect(toggle).toHaveAttribute('aria-checked', 'true')
+      await toggle.click()
+      await expect(toggle).toHaveAttribute('aria-checked', 'false')
+      await toggle.click()
+      await expect(toggle).toHaveAttribute('aria-checked', 'true')
+      await page.evaluate(() => { location.hash = '#/session-workspace' })
+      await expect(page.getByText('4 / 4 sessions', { exact: true })).toBeVisible()
+    }
+
+    await rebindWorkspace()
     await expect(page.locator('[data-workspace-session]')).toHaveCount(4, { timeout: 10_000 })
+
     for (const id of ids) {
       const tile = page.locator(`[data-workspace-session="${id}"]`)
       await expect(tile).toContainText(`Synthetic saved answer ${id}`)
       await expect(tile.locator('[data-slot="composer-root"] [contenteditable="true"]').first()).toBeVisible()
     }
+
     const draft = page.locator(`[data-workspace-session="${ids[0]}"] [contenteditable="true"]`).first()
     await draft.fill('復元後の隔離下書き')
     await page.evaluate(() => { location.hash = '#/settings' })
-    await page.waitForTimeout(200)
+    await expect(page.locator('[data-overlay-surface]')).toBeVisible()
+    await expect(page).toHaveURL(/#\/settings/)
     await page.evaluate(() => { location.hash = '#/session-workspace' })
     await expect(draft).toHaveText('復元後の隔離下書き')
+    await rebindWorkspace()
+    await expect(draft).toHaveText('復元後の隔離下書き')
+    await expect(page.locator('[data-workspace-session]')).toHaveCount(4)
     expect(provider.completions).toHaveLength(0)
     await page.screenshot({ path: path.join(sandbox.root, 'restored-after-rebind.png') })
     console.log('RESTORE_GATE: selection=4/4 after restart/settings/rebind; composers=4; provider_calls=0')
@@ -96,5 +113,6 @@ test('saved four-pane selection survives restart, settings revisit and plugin re
     await provider.close()
     sandbox.cleanup()
   }
+
   await expect.poll(() => sandboxProcesses(sandbox).length, { timeout: 30_000 }).toBe(0)
 })

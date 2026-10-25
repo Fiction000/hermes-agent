@@ -1,7 +1,7 @@
 import './session-workspace.css'
 
 import { useStore } from '@nanostores/react'
-import { useLayoutEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
 
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { SessionTilePane } from '@/app/chat/session-tile'
@@ -41,6 +41,7 @@ import {
   WORKSPACE_MAX_SESSIONS,
   workspaceOwnerRouteForRow,
   type WorkspaceSessionKey,
+  workspaceSessionsToRestore,
   workspaceTileScope
 } from './model'
 import {
@@ -232,6 +233,38 @@ export function SessionWorkspacePage() {
   }, [])
 
   const sourceRows = useMemo(() => [...sessions, ...cronSessions, ...messagingSessions], [cronSessions, messagingSessions, sessions])
+
+  useEffect(() => {
+    const available = resolveRows(sourceRows).flatMap(({ ownerRoute, row }) =>
+      ownerRoute ? [{ storedSessionId: row.id, ownerRoute }] : []
+    )
+
+    const blockedStoredSessionIds = new Set<string>()
+
+    if (mainSessionId) {
+      for (const alias of lineageAliases(mainSessionId, $sessions.get())) {
+        blockedStoredSessionIds.add(alias)
+      }
+    }
+
+    for (const tile of tiles) {
+      for (const alias of lineageAliases(tile.storedSessionId, $sessions.get())) {
+        blockedStoredSessionIds.add(alias)
+      }
+    }
+
+    for (const key of selected) {
+      const [eligible] = workspaceSessionsToRestore([key], available, $sessionTiles.get(), blockedStoredSessionIds)
+
+      if (!eligible) {continue}
+
+      openSessionTile(eligible.storedSessionId, 'right', 'workspace', undefined, workspaceTileScope(eligible))
+
+      for (const alias of lineageAliases(eligible.storedSessionId, $sessions.get())) {
+        blockedStoredSessionIds.add(alias)
+      }
+    }
+  }, [mainSessionId, selected, sourceRows, tiles])
 
   const rows = resolveRows(sourceRows)
   const selectedTiles = useMemo(() => selectedWorkspaceTiles(tiles, selected), [selected, tiles])
