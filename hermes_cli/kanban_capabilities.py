@@ -142,6 +142,12 @@ def _read_profile_policy(home: Path) -> dict:
     policy = {k: cfg[k] for k in ("platform_toolsets", "toolsets", "disabled_toolsets") if k in cfg}
     if "${" in repr(policy):
         raise ValueError("unresolved policy reference")
+    from hermes_cli.toolset_validation import parse_platform_toolsets_value
+    platform_toolsets = cfg.get("platform_toolsets", {})
+    if not isinstance(platform_toolsets, dict):
+        raise ValueError("invalid platform toolsets mapping")
+    if "cli" in platform_toolsets and parse_platform_toolsets_value(platform_toolsets["cli"]) is None:
+        raise ValueError("invalid saved CLI tool selection")
     return cfg
 
 
