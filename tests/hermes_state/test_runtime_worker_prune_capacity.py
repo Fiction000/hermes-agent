@@ -1,6 +1,8 @@
 """An unsent best-effort prune must not poison required worker persistence."""
 import copy
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest.mock import patch
 
@@ -161,6 +163,52 @@ def test_optional_archive_only_recovers_presend_capacity_rejection(worker, failu
         store.retry_pending()  # Existing sequence/digest receipt replay, never a fresh command.
         assert store.failure is None and store.journal['pending'] == []
         assert [r['content'] for r in db.get_messages_as_conversation('owned')] == ['summary']
-        assert db._read_one('SELECT COUNT(*) FROM worker_mutation_receipts')[0] == 1
+        assert db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 1
     else:
         assert not calls and not store.journal['pending']
+
+
+@pytest.mark.parametrize('lost_ack', [False, True])
+def test_slow_owner_never_admits_a_second_command_before_receipt(worker, lost_ack):
+    db, store = worker
+    entered, release = threading.Event(), threading.Event()
+    rpc = store.rpc
+    calls = []
+
+    def slow_owner(method, **params):
+        calls.append(params['sequence'])
+        result = rpc(method, **params)
+        if params['operation'] == 'compression.archive':
+            entered.set()
+            assert release.wait(10), 'test did not release the synthetic owner'
+            if lost_ack:
+                raise TimeoutError('slow-owner-lost-ack')
+        return result
+
+    with patch.object(store, 'rpc', slow_owner), ThreadPoolExecutor(max_workers=2) as pool:
+        archive = pool.submit(store.archive_pruned_messages, 'owned', [
+            {'role': 'assistant', 'content': 'summary'}])
+        try:
+            assert entered.wait(10), 'synthetic owner did not receive the archive'
+            after = pool.submit(store.append_messages_batch, 'owned', [
+                {'role': 'assistant', 'content': 'after'}])
+            assert not after.done()
+            assert calls == [1] and store.journal['pending'][0]['sequence'] == 1
+        finally:
+            release.set()
+        if lost_ack:
+            with pytest.raises(TimeoutError, match='slow-owner-lost-ack'):
+                archive.result(timeout=10)
+            with pytest.raises(WorkerPersistenceError, match='slow-owner-lost-ack'):
+                after.result(timeout=10)
+        else:
+            assert archive.result(timeout=10) == 1
+            assert after.result(timeout=10) == 1
+
+    assert calls == ([1] if lost_ack else [1, 2])
+    rows = db.get_messages_as_conversation('owned')
+    assert [r['content'] for r in rows] == (['summary'] if lost_ack else ['summary', 'after'])
+    if lost_ack:
+        assert store.failure and len(store.journal['pending']) == 1
+    else:
+        assert store.failure is None and store.journal['pending'] == []
