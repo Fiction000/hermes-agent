@@ -1,4 +1,6 @@
 .session-workspace-root { container-type: inline-size; }
+.session-workspace-root [data-slot="composer-root"] { --composer-fill: var(--dt-card) !important; }
+.session-workspace-root [data-slot="composer-fade"] { opacity: 1; }
 .session-workspace-board {
   container-type: inline-size;
   position: relative;

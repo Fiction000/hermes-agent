@@ -447,8 +447,10 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
           await expect(tileOne.locator('[data-slot="composer-root"]')).toHaveAttribute('data-thread-scrolled-up', '')
           await expect.poll(() => tileOne.locator('[data-slot="composer-fade"]').evaluate(async node => {
             await Promise.all(node.getAnimations().map(animation => animation.finished))
+
             return true
           })).toBe(true)
+
           const metrics = await tileOne.evaluate(node => {
             const fade = node.querySelector('[data-slot="composer-fade"]')!
             const surface = node.querySelector('[data-slot="composer-surface"]')!
@@ -458,6 +460,7 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
             const context = document.createElement('canvas').getContext('2d')!
             context.fillStyle = background
             context.fillRect(0, 0, 1, 1)
+
             return {
               opacity: getComputedStyle(fade).opacity,
               background,
@@ -470,6 +473,7 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
               controlColor: getComputedStyle(fade.querySelector('button')!).color
             }
           })
+
           readability.push({ width, colorScheme, requestedFocus: focused, ...metrics })
           await page.screenshot({ path: path.join(process.env.HERMES_E2E_CORE_ROOT!, `q1-${width}-${colorScheme}-${focused ? 'focused' : 'blurred'}.png`) })
           expect(await draftHandle!.evaluate(node => node.isConnected)).toBe(true)
@@ -495,12 +499,15 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     await lowest.scrollIntoViewIfNeeded()
     const lowestComposer = lowest.locator('[contenteditable="true"]').first()
     await expect(lowestComposer).toBeInViewport()
+
     const reachable = await lowestComposer.evaluate(node => {
       const box = node.getBoundingClientRect()
       const board = node.closest('.session-workspace-board')!.getBoundingClientRect()
       const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+
       return { top: box.top, bottom: box.bottom, boardTop: board.top, boardBottom: board.bottom, hit: node === hit || node.contains(hit) }
     })
+
     expect(reachable.top).toBeGreaterThanOrEqual(reachable.boardTop)
     expect(reachable.bottom).toBeLessThanOrEqual(reachable.boardBottom)
     expect(reachable.hit).toBe(true)
@@ -534,12 +541,14 @@ test('Session Workspace opens four owner-routed chats and sends/cancels through 
     await expect(page.locator('section.session-workspace-card[aria-label]')).toHaveCount(4)
     expect(await page.locator('[data-workspace-slot]').evaluateAll(nodes => nodes.map(node => ({ index: node.getAttribute('data-workspace-slot'), id: node.querySelector('[data-workspace-session]')?.getAttribute('data-workspace-session') })).sort((a, b) => Number(a.index) - Number(b.index)))).toEqual(arrangement)
     await expect(page.getByRole('separator', { name: /Resize columns/ })).toHaveAttribute('aria-valuenow', splitRatio!)
+
     for (const sample of readability) {
       expect.soft(sample.focused, JSON.stringify(sample)).toBe(sample.requestedFocus)
       expect.soft(sample.scrolledUp, JSON.stringify(sample)).toBe(true)
       expect.soft(sample.opacity, JSON.stringify(sample)).toBe('1')
       expect.soft(sample.backgroundAlpha, JSON.stringify(sample)).toBe(255)
     }
+
     console.log('V2_NATIVE gestures=tile+roster-edge+keyboard escape=focus-return draft=retained preset=3-visible+4-reachable approvals=2-owner-runtime-scoped creation=production-contract new-composer=focused capacity=disabled narrow=no-document-overflow reduced-motion=reduce persistence=reload')
     console.log(
       `NATIVE_SESSION_WORKSPACE_SMOKE isolation=verified roster=4 tiles=4 ipc_api_paths=${new Set(apiPaths).size} ` +
