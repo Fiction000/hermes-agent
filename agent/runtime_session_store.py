@@ -47,6 +47,10 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class OutboxCapacityError(WorkerPersistenceError):
+    """The encoded journal candidate exceeds its configured byte capacity."""
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -293,7 +297,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     entry['operation'] == 'compression.publish' for entry in self.journal['pending']))):
             raise WorkerPersistenceError('outbox_scope_mismatch')
         candidate = dict(self.journal, scope=dict(old, epoch=new['epoch']))
-        self._save(candidate)
+        try:
+            self._save(candidate)
+        except OutboxCapacityError as exc:
+            self.failure = str(exc)
+            raise
         self.scope = candidate['scope']
         self.journal = candidate
 
@@ -302,8 +310,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_closed')
         encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
         if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
+            logger.warning('Worker persistence outbox rejected: encoded_bytes=%d max_bytes=%d',
+                           len(encoded), self.max_bytes)
+            raise OutboxCapacityError('outbox_full')
         from utils import atomic_write_bytes
         # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
         atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
@@ -312,7 +321,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, *, allow_unsent_oversize=False):
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -324,6 +333,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate['next_sequence'] += 1
             try:
                 self._save(candidate)
+            except OutboxCapacityError as exc:
+                if not allow_unsent_oversize:
+                    self.failure = str(exc)
+                raise
             except Exception as exc:
                 self.failure = str(exc)
                 raise
@@ -353,7 +366,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         """Install only a separately verified worker.adopt result; never self-adopt."""
         with self.lock:
             candidate = dict(self.journal, scope=dict(self.scope, epoch=epoch))
-            self._save(candidate)
+            try:
+                self._save(candidate)
+            except OutboxCapacityError as exc:
+                self.failure = str(exc)
+                raise
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
