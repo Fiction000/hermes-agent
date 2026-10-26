@@ -66,7 +66,8 @@ class RuntimeSessionCompressionMixin:
 
     def archive_and_compact(self, session_id, compacted_messages, model_config_patch=None,
                             watermark=None, lock_holder=None, tail_count=0, carried_messages=None,
-                            covered_ids=None, unresolved_held=None, held_for_cas=None):
+                            covered_ids=None, unresolved_held=None, held_for_cas=None,
+                            *, _allow_unsent_oversize=False):
         self._session(session_id)
         # A carried message names an exact durable original (its _row_id) to rewind rather than
         # archive (#118900); the owner resolves identities against its own store. Held-row
@@ -84,10 +85,16 @@ class RuntimeSessionCompressionMixin:
         result = self._apply('compression.archive', dict(messages=_handoff_rows(compacted_messages),
             model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,
             tail_count=tail_count, carried_messages=carried, covered_ids=covered_ids,
-            unresolved_held=unresolved, held_for_cas=cas))
+            unresolved_held=unresolved, held_for_cas=cas),
+            allow_unsent_oversize=_allow_unsent_oversize)
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
         return result['value']
+
+    def archive_pruned_messages(self, session_id, compacted_messages, **kwargs):
+        """Archive a best-effort prune without poisoning writes when its unsent journal is too large."""
+        return self.archive_and_compact(session_id, compacted_messages,
+            _allow_unsent_oversize=True, **kwargs)
 
     def publish_compression_child(self, *, parent_session_id, child_session_id, source, messages,
             model=None, model_config=None, system_prompt=None, cwd=None, profile_name=None,

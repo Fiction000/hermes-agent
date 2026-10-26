@@ -59,10 +59,14 @@ class ProactivePruneMixin:
         # Under-threshold runway skip is ordinary hysteresis (silent); above it the lockout is the bug.
         if before < self._proactive_prune_rearm_tokens and not self._billed_basis_over_threshold(current_tokens):
             return messages, 0
-        # Capability gate first: a store without archive_and_compact makes every prune a no-op.
+        # Capability gate first: a store needs a durable archive path before pruning.
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
-        if session_db and session_id and not callable(getattr(session_db, "archive_and_compact", None)):
+        archive_prune = (getattr(session_db, "archive_pruned_messages", None)
+                         if session_db else None)
+        archive_full = (archive_prune if callable(archive_prune) else
+                        getattr(session_db, "archive_and_compact", None) if session_db else None)
+        if session_db and session_id and not callable(archive_full):
             self._warn_reclamation_no_op("prune:store_cannot_persist", current_tokens)
             return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
@@ -96,7 +100,8 @@ class ProactivePruneMixin:
                 if rewritten is None:
                     from agent.conversation_compression_archive import coverage_for_commit
                     covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, messages)
-                    session_db.archive_and_compact(
+                    assert callable(archive_full)
+                    archive_full(
                         session_id, pruned_msgs,
                         model_config_patch=model_config_patch,
                         watermark=watermark,
