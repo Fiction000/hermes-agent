@@ -45,9 +45,11 @@ import {
   workspaceTileScope
 } from './model'
 import {
+  $sessionWorkspaceCanRecoverLegacy,
   $sessionWorkspaceFocused,
   $sessionWorkspaceLayout,
   $sessionWorkspaceSelection,
+  recoverLegacySessionWorkspace,
   setSessionWorkspaceFocused,
   setSessionWorkspaceLayout,
   setSessionWorkspaceSelection,
@@ -217,6 +219,7 @@ export function SessionWorkspacePage() {
   const statuses = useStore($sessionDotStateById)
   const tiles = useStore($sessionTiles)
   const selected = useStore($sessionWorkspaceSelection)
+  const canRecoverLegacy = useStore($sessionWorkspaceCanRecoverLegacy)
   const layout = useStore($sessionWorkspaceLayout)
   const focused = useStore($sessionWorkspaceFocused)
   const mainSessionId = useStore($selectedStoredSessionId)
@@ -458,6 +461,12 @@ export function SessionWorkspacePage() {
             <span aria-hidden className="mx-auto grid size-10 place-items-center rounded-full bg-(--ui-bg-quaternary) text-xl text-(--ui-text-tertiary)">＋</span>
             <h2 className="text-sm font-medium text-(--ui-text-primary)" role={sessionsLoadError && sourceRows.length === 0 ? 'alert' : undefined}>{sessionsLoadError ? t('page.loadError') : sessionsLoading ? t('page.loading') : sourceRows.length === 0 ? t('page.noSessions') : t('page.emptyTitle')}</h2>
             {!sessionsLoading && !sessionsLoadError && sourceRows.length > 0 ? <p className="text-xs text-(--ui-text-tertiary)">{t('page.emptyBody')}</p> : null}
+            {canRecoverLegacy ? (
+              <div className="space-y-1">
+                <p className="text-xs text-(--ui-text-tertiary)">{t('page.recoverLegacyBody')}</p>
+                <Button onClick={recoverLegacySessionWorkspace} size="sm" type="button" variant="outline">{t('page.recoverLegacy')}</Button>
+              </div>
+            ) : null}
             {!sessionsLoadError && !sessionsLoading ? (
               <Button onClick={openPicker} size="sm" type="button" variant="secondary">{t('page.addSession')}</Button>
             ) : null}

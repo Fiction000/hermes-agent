@@ -22,6 +22,7 @@ export function setSessionWorkspaceSplits(value: WorkspaceSplits): void {
 export const $sessionWorkspaceSelection = atom<WorkspaceSessionKey[]>([])
 export const $sessionWorkspaceLayout = atom<WorkspaceLayout>('grid')
 export const $sessionWorkspaceFocused = atom<WorkspaceSessionKey | null>(null)
+export const $sessionWorkspaceCanRecoverLegacy = atom(false)
 
 const STORAGE_SELECTION = 'selection.v1'
 const STORAGE_LAYOUT = 'layout.v1'
@@ -81,6 +82,7 @@ function write(storage: PluginStorage, key: string, value: unknown): void {
 }
 
 let unbindCurrent: (() => void) | undefined
+let recoverableLegacy: WorkspaceSessionKey[] | undefined
 
 export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void {
   unbindCurrent?.()
@@ -88,7 +90,11 @@ export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void 
   currentStorage = storage
   const savedKey = read<string>(storage, 'arrangement.last.v2', 'arrangement.v2')
   const saved = read<{ selection?: unknown; layout?: unknown; focused?: unknown } | null>(storage, typeof savedKey === 'string' && savedKey.startsWith('arrangement.') ? savedKey : 'arrangement.v2', null)
-  $sessionWorkspaceSelection.set(parseSelection(saved?.selection ?? read(storage, STORAGE_SELECTION, [])))
+  const selected = parseSelection(saved?.selection ?? read(storage, STORAGE_SELECTION, []))
+  const legacySelection = parseSelection(read(storage, STORAGE_SELECTION, []))
+  recoverableLegacy = selected.length === 0 && legacySelection.length > 0 ? legacySelection : undefined
+  $sessionWorkspaceCanRecoverLegacy.set(Boolean(recoverableLegacy))
+  $sessionWorkspaceSelection.set(selected)
 
   const savedLayout = saved?.layout ?? read<unknown>(storage, STORAGE_LAYOUT, 'grid')
   $sessionWorkspaceLayout.set(savedLayout === 'focus' || savedLayout === 'split' ? savedLayout : 'grid')
@@ -103,6 +109,11 @@ export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void 
   }
 
   const offSelection = $sessionWorkspaceSelection.listen(() => {
+    if (recoverableLegacy && $sessionWorkspaceSelection.get().length > 0) {
+      recoverableLegacy = undefined
+      $sessionWorkspaceCanRecoverLegacy.set(false)
+    }
+
     $sessionWorkspaceSplits.set(parseSplits(read(storage, splitKey(), DEFAULT_SPLITS)))
     persist()
   })
@@ -120,6 +131,8 @@ export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void 
     offLayout()
     offFocus()
     $sessionWorkspaceActive.set(false)
+    recoverableLegacy = undefined
+    $sessionWorkspaceCanRecoverLegacy.set(false)
 
     if (unbindCurrent === unbind) {unbindCurrent = undefined; currentStorage = undefined}
   }
@@ -127,6 +140,22 @@ export function bindSessionWorkspaceStorage(storage: PluginStorage): () => void 
   unbindCurrent = unbind
 
   return unbind
+}
+
+export function recoverLegacySessionWorkspace(): void {
+  const storage = currentStorage
+  const selection = recoverableLegacy
+
+  if (!storage || !selection || $sessionWorkspaceSelection.get().length > 0) {return}
+
+  recoverableLegacy = undefined
+  $sessionWorkspaceCanRecoverLegacy.set(false)
+  $sessionWorkspaceSelection.set(selection)
+  const savedLayout = read<unknown>(storage, STORAGE_LAYOUT, 'grid')
+  $sessionWorkspaceLayout.set(savedLayout === 'focus' || savedLayout === 'split' ? savedLayout : 'grid')
+  const savedFocus = parseKey(read(storage, STORAGE_FOCUS, null))
+  $sessionWorkspaceFocused.set(selection.find(key => savedFocus && sameWorkspaceSession(key, savedFocus)) ?? selection[0] ?? null)
+  $sessionWorkspaceSplits.set(parseSplits(read(storage, splitKey(), DEFAULT_SPLITS)))
 }
 
 export function setSessionWorkspaceSelection(selection: WorkspaceSessionKey[]): void {

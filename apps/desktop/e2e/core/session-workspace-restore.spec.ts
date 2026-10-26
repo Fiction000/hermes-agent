@@ -47,10 +47,12 @@ test(`saved four-pane selection survives restart, settings revisit and plugin re
       localStorage.setItem('hermes.plugin.session-workspace.selection.v1', JSON.stringify(selected))
       localStorage.setItem('hermes.plugin.session-workspace.layout.v1', JSON.stringify('grid'))
       localStorage.setItem('hermes.plugin.session-workspace.focus.v1', JSON.stringify(selected[0]))
+
       if (recoverLegacy) {
         localStorage.setItem('hermes.plugin.session-workspace.arrangement.last.v2', JSON.stringify('arrangement.v2.[]'))
         localStorage.setItem('hermes.plugin.session-workspace.arrangement.v2.[]', JSON.stringify({ selection: [], layout: 'grid', focused: null }))
       }
+
       localStorage.setItem('hermes.desktop.sessionTiles.v2', JSON.stringify({ default: [
         { storedSessionId: 'unrelated-saved-tab', anchor: 'workspace', dir: 'center', workspaceMode: 'sessions' }
       ] }))
@@ -64,6 +66,7 @@ test(`saved four-pane selection survives restart, settings revisit and plugin re
     await waitForInteractive(app, page)
     await page.setViewportSize({ width: 1600, height: 1000 })
     await page.evaluate(() => { location.hash = '#/session-workspace' })
+
     if (recoverLegacy) {
       await expect(page.getByText('0 / 4 sessions', { exact: true })).toBeVisible()
       const restore = page.getByRole('button', { name: 'Restore saved v1 selection', exact: true })
@@ -74,6 +77,7 @@ test(`saved four-pane selection survives restart, settings revisit and plugin re
       await restore.click()
       await expect(restore).toHaveCount(0)
     }
+
     await expect(page.getByText('4 / 4 sessions', { exact: true })).toBeVisible()
     await page.screenshot({ path: path.join(sandbox.root, 'restored-before-check.png') })
     const diagnostics = await page.evaluate(() => Object.fromEntries(Object.entries(localStorage).filter(([key]) => /session-workspace|sessionTiles/.test(key))))
@@ -122,6 +126,7 @@ test(`saved four-pane selection survives restart, settings revisit and plugin re
     await expect(page.locator('[data-workspace-session]')).toHaveCount(4)
     expect(provider.completions).toHaveLength(0)
     await page.screenshot({ path: path.join(sandbox.root, 'restored-after-rebind.png') })
+
     if (recoverLegacy) {
       await app.close()
       app = undefined
@@ -131,15 +136,18 @@ test(`saved four-pane selection survives restart, settings revisit and plugin re
       await restarted.page.evaluate(() => { location.hash = '#/session-workspace' })
       await expect(restarted.page.getByText('4 / 4 sessions', { exact: true })).toBeVisible()
       await expect(restarted.page.locator('[data-workspace-session]')).toHaveCount(4)
+
       for (let i = 0; i < 4; i++) {
         await restarted.page.getByRole('button', { name: /^Remove .* from workspace$/ }).first().click()
       }
+
       await expect(restarted.page.getByText('0 / 4 sessions', { exact: true })).toBeVisible()
       await restarted.page.reload()
       await expect(restarted.page.getByText('0 / 4 sessions', { exact: true })).toBeVisible()
       await expect(restarted.page.getByRole('button', { name: 'Restore saved v1 selection', exact: true })).toBeVisible()
       expect(provider.completions).toHaveLength(0)
     }
+
     console.log('RESTORE_GATE: selection=4/4 after restart/settings/rebind; composers=4; provider_calls=0')
   } finally {
     await app?.close().catch(() => {})
