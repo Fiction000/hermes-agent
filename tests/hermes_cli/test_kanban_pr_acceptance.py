@@ -19,6 +19,12 @@ def github(tmp_path, monkeypatch):
         def do_GET(self):
             state["requests"].append(self.path)
             sha = state["head"]
+            if state.get("error_path", "/rules/branches/") in self.path and state.get("api_error"):
+                status, message = state["api_error"]
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": message}).encode())
+                return
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
@@ -47,6 +53,8 @@ def github(tmp_path, monkeypatch):
             else:
                 self.send_error(404)
                 return
+            if self.path == "/graphql" and state.get("no_required"):
+                value["data"]["repository"]["pullRequest"]["baseRef"] = None
             self.send_response(200)
             self.end_headers()
             self.wfile.write(json.dumps(value).encode())
@@ -60,9 +68,13 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    print(e.read().decode())\n"
+                  "    print(f'gh: request failed (HTTP {e.code})', file=sys.stderr)\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +242,82 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+_PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("fault", "classification"), [
+    (None, "success"), ("failure", "failure"), ("pending", "pending"),
+    ("stale", "stale"), ("head_change", "stale"), ("missing", "missing"),
+    ("no_required", "missing"),
+])
+def test_plan_unavailable_rules_preserve_required_exact_head_gate(github, fault, classification):
+    github["api_error"] = (403, _PLAN_MESSAGE)
+    if fault in {"failure", "pending"}:
+        github["conclusion"] = fault
+    elif fault:
+        github[fault] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="plan-limited", completion_contract="acme/repo")
+        ok = kb.complete_task(conn, tid, summary="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert (kb.get_task(conn, tid).status == "done") is ok
+    assert ok is (classification == "success")
+    assert receipt["classification"] == classification
+    assert receipt["branch_rules"] == {"status": "plan_unavailable"}
+    assert receipt["required"] == ([] if fault == "no_required" else [{"context": "required", "app_id": 1}])
+    if fault == "no_required":
+        assert not any("/check-runs" in p for p in github["requests"])
+    else:
+        assert any("/check-runs" in p for p in github["requests"])
+        assert any("/pulls/7" in p for p in github["requests"])
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("status", "message", "classification"), [
+    (403, "Resource not accessible by integration", "auth"),
+    (401, _PLAN_MESSAGE, "auth"), (404, _PLAN_MESSAGE, "auth"),
+    (500, _PLAN_MESSAGE, "infra"), (503, _PLAN_MESSAGE, "infra"),
+])
+def test_rules_errors_other_than_plan_403_keep_their_classification(github, status, message, classification):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github["api_error"] = (status, message)
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == classification
+    assert "branch_rules" not in receipt
+    assert not any("/check-runs" in p for p in github["requests"])
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("endpoint", ["/graphql", "/check-runs", "/statuses", "/pulls/"])
+def test_plan_403_from_other_endpoints_still_fails_auth(github, endpoint):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(api_error=(403, _PLAN_MESSAGE), error_path=endpoint)
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == "auth"
+    assert "branch_rules" not in receipt
+
+
+@pytest.mark.parametrize("body", ["not JSON", "[]", "null", '{"message": null}',
+                                    '{"message": 403}', '{"detail": "Upgrade to GitHub Pro"}'])
+def test_malformed_rules_error_cannot_enable_plan_exception(monkeypatch, body):
+    import subprocess
+
+    from hermes_cli.kanban_pr_acceptance import _api, _GateAuthError
+
+    def denied(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0], output=body,
+                                            stderr=f"gh: {_PLAN_MESSAGE} (HTTP 403)")
+
+    monkeypatch.setattr(subprocess, "run", denied)
+    with pytest.raises(_GateAuthError):
+        _api("repos/acme/repo/rules/branches/main?per_page=100", paginate=True)
+
