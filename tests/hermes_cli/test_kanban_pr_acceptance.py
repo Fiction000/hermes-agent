@@ -68,11 +68,12 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
                   "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
                   "except urllib.error.HTTPError as e:\n"
-                  "    print(e.read().decode())\n"
+                  "    body=json.loads(e.read().decode())\n"
+                  "    print(json.dumps([body] if '--slurp' in sys.argv else body))\n"
                   "    print(f'gh: request failed (HTTP {e.code})', file=sys.stderr)\n"
                   "    sys.exit(1)\n")
     gh.chmod(0o755)
@@ -320,4 +321,3 @@ def test_malformed_rules_error_cannot_enable_plan_exception(monkeypatch, body):
     monkeypatch.setattr(subprocess, "run", denied)
     with pytest.raises(_GateAuthError):
         _api("repos/acme/repo/rules/branches/main?per_page=100", paginate=True)
-
