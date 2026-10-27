@@ -31,7 +31,7 @@ def github(tmp_path, monkeypatch):
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
-                value = [[]]
+                value = [state.get("rules", [])]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
@@ -39,17 +39,24 @@ def github(tmp_path, monkeypatch):
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
-                value = [{"total_count": 100 + len(runs), "check_runs": [
-                    {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
-                    for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+                optional_count = state.get("optional_count", 100)
+                value = [{"total_count": optional_count + len(runs), "check_runs": [
+                    {**run, "id": 1000 + i, "name": "optional",
+                     "conclusion": state.get("optional_conclusion", "skipped")}
+                    for i in range(optional_count)]},
+                    {"total_count": optional_count + len(runs), "check_runs": runs}]
+                if state.get("incomplete"):
+                    value[0]["total_count"] += 1
                 if state.get("race"):
                     state["race"]()
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
-                value = [[]]
+                value = [state.get("statuses", [])]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha},
+                         "base": {"ref": "other" if state.get("base_change") else "main"},
+                         "state": "open"}
             else:
                 self.send_error(404)
                 return
@@ -252,7 +259,7 @@ _PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable 
 @pytest.mark.parametrize(("fault", "classification"), [
     (None, "success"), ("failure", "failure"), ("pending", "pending"),
     ("stale", "stale"), ("head_change", "stale"), ("missing", "missing"),
-    ("no_required", "missing"),
+    ("no_required", "infra"),
 ])
 def test_plan_unavailable_rules_preserve_required_exact_head_gate(github, fault, classification):
     github["api_error"] = (403, _PLAN_MESSAGE)
@@ -266,16 +273,15 @@ def test_plan_unavailable_rules_preserve_required_exact_head_gate(github, fault,
             "published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
-        assert (kb.get_task(conn, tid).status == "done") is ok
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status == "done") is ok
     assert ok is (classification == "success")
     assert receipt["classification"] == classification
     assert receipt["branch_rules"] == {"status": "plan_unavailable"}
     assert receipt["required"] == ([] if fault == "no_required" else [{"context": "required", "app_id": 1}])
-    if fault == "no_required":
-        assert not any("/check-runs" in p for p in github["requests"])
-    else:
-        assert any("/check-runs" in p for p in github["requests"])
-        assert any("/pulls/7" in p for p in github["requests"])
+    assert any("/check-runs" in p for p in github["requests"])
+    assert any("/pulls/7" in p for p in github["requests"])
 
 
 @pytest.mark.platforms("posix")
@@ -321,3 +327,82 @@ def test_malformed_rules_error_cannot_enable_plan_exception(monkeypatch, body):
     monkeypatch.setattr(subprocess, "run", denied)
     with pytest.raises(_GateAuthError):
         _api("repos/acme/repo/rules/branches/main?per_page=100", paginate=True)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("plan_limited", [False, True])
+@pytest.mark.parametrize(("fault", "classification"), [
+    (None, "success"), ("failure", "failure"), ("pending", "pending"),
+    ("cancelled", "infra"), ("neutral", "infra"), ("skipped", "infra"),
+    ("timed_out", "infra"), ("action_required", "infra"),
+    ("unknown", "infra"), ("no_conclusion", "infra"),
+    ("missing", "missing"), ("stale", "stale"),
+    ("head_change", "stale"), ("base_change", "stale"),
+    ("incomplete", "infra"),
+])
+def test_no_required_checks_accept_only_successful_exact_head_ci(github, plan_limited, fault, classification):
+    github.update(no_required=True, optional_count=0)
+    if plan_limited:
+        github["api_error"] = (403, _PLAN_MESSAGE)
+    if fault in {"missing", "stale", "head_change", "base_change", "incomplete"}:
+        github[fault] = True
+    elif fault:
+        github["conclusion"] = None if fault == "no_conclusion" else fault
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no-required", completion_contract="acme/repo")
+        ok = kb.complete_task(conn, tid, summary="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status == "done") is ok
+    assert ok is (classification == "success")
+    assert receipt["classification"] == classification
+    assert receipt["head_sha"] == "a" * 40
+    assert receipt["required"] == []
+    assert any("/statuses" in p for p in github["requests"]) is (fault != "incomplete")
+    if plan_limited:
+        assert receipt["branch_rules"] == {"status": "plan_unavailable"}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("required_source", [None, "graphql", "rules"])
+@pytest.mark.parametrize("optional_conclusion", ["success", "failure", "pending", "cancelled", "neutral", "skipped"])
+def test_optional_checks_matter_only_without_required_checks(github, required_source, optional_conclusion):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=required_source != "graphql", optional_conclusion=optional_conclusion)
+    if required_source == "rules":
+        github["rules"] = [{"type": "required_status_checks", "parameters": {
+            "required_status_checks": [{"context": "required", "integration_id": 1}]}}]
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is (required_source is not None or optional_conclusion == "success")
+    assert len(receipt["checks"]) == (1 if required_source else 101)
+    assert {c["head_sha"] for c in receipt["checks"]} == {"a" * 40}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("runs_present", [False, True])
+@pytest.mark.parametrize("status_state", ["success", "failure", "pending", "error", "unknown"])
+def test_no_required_checks_include_legacy_statuses(github, runs_present, status_state):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=0, missing=not runs_present,
+                  statuses=[{"id": 43, "context": "legacy", "state": status_state}])
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is (status_state == "success")
+    assert {c["id"] for c in receipt["checks"]} == ({42, 43} if runs_present else {43})
+
+
+@pytest.mark.platforms("posix")
+def test_no_required_checks_do_not_hide_unsuccessful_legacy_status(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=0, statuses=[
+        {"id": 44, "context": "legacy", "state": "success"},
+        {"id": 43, "context": "legacy", "state": "pending"}])
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == "pending"
+    assert {c["id"] for c in receipt["checks"]} == {42, 43, 44}
