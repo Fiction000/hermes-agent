@@ -154,7 +154,7 @@ def _workflow_evidence(repo: str, sha: str, profile_home: str | None) -> tuple[l
         item = {"run_id": run.get("id"), "name": run.get("name"), "head_sha": run["head_sha"],
                 "status": run["status"], "conclusion": run["conclusion"], "check_suite_id": suite_id,
                 "url": run.get("html_url")}
-        if type(item["run_id"]) is not int or not isinstance(item["name"], str):
+        if type(item["run_id"]) is not int or item["run_id"] <= 0 or not isinstance(item["name"], str):
             raise ValueError("Malformed workflow-run identity")
         evidence.append(item)
         by_suite[suite_id] = item
@@ -239,7 +239,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 check_app = check.get("app")
                 suite_id = check_suite.get("id") if isinstance(check_suite, dict) else None
                 app_slug = check_app.get("slug") if isinstance(check_app, dict) else None
-                if is_run and outcome == "skipped" and app_slug == "github-actions" and type(suite_id) is int:
+                if (is_run and outcome == "skipped" and app_slug == "github-actions"
+                        and type(suite_id) is int and check.get("head_sha") == sha
+                        and check.get("status") == "completed"):
                     workflow = workflow_by_suite.get(suite_id)
                 classification = "skipped" if workflow else _classify(check, sha, outcome, is_run)
                 outcomes.append("success" if workflow else classification)
