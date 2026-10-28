@@ -124,6 +124,45 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
 
 
+def _workflow_evidence(repo: str, sha: str, profile_home: str | None) -> tuple[list[dict], dict[int, dict]]:
+    pages = _api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100",
+                 paginate=True, profile_home=profile_home)
+    if not pages or any(not isinstance(page, dict) for page in pages):
+        raise ValueError("Missing or malformed workflow-run pagination")
+    total = pages[0].get("total_count")
+    if type(total) is not int or total < 0:
+        raise ValueError("Malformed workflow-run count")
+    if any(page.get("total_count") != total or not isinstance(page.get("workflow_runs"), list)
+           for page in pages):
+        raise ValueError("Inconsistent workflow-run pagination")
+    runs = [run for page in pages for run in page["workflow_runs"]]
+    if any(not isinstance(run, dict) for run in runs):
+        raise ValueError("Malformed workflow-run entry")
+    if len({run.get("id") for run in runs}) != len(runs) or len(runs) != total:
+        raise ValueError("Incomplete workflow-run pagination")
+    evidence = []
+    by_suite = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            raise ValueError("Malformed workflow-run entry")
+        if (run.get("head_sha") != sha
+                or run.get("status") != "completed" or run.get("conclusion") != "success"):
+            raise ValueError("Workflow run is not successful for the captured head")
+        suite_id = run.get("check_suite_id")
+        if type(suite_id) is not int or suite_id <= 0 or suite_id in by_suite:
+            raise ValueError("Workflow run has missing or duplicate check-suite identity")
+        item = {"run_id": run.get("id"), "name": run.get("name"), "head_sha": run["head_sha"],
+                "status": run["status"], "conclusion": run["conclusion"], "check_suite_id": suite_id,
+                "url": run.get("html_url")}
+        if type(item["run_id"]) is not int or not isinstance(item["name"], str):
+            raise ValueError("Malformed workflow-run identity")
+        evidence.append(item)
+        by_suite[suite_id] = item
+    if total == 0:
+        raise ValueError("No exact-head workflow runs found")
+    return evidence, by_suite
+
+
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
@@ -170,6 +209,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
         runs = [run for page in pages for run in page["check_runs"]]
         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
             raise ValueError("Incomplete check-run pagination")
+        workflows, workflow_by_suite = ([], {})
+        if not required:
+            workflows, workflow_by_suite = _workflow_evidence(repo, sha, profile_home)
+            receipt["workflows"] = workflows
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         groups = []
@@ -191,12 +234,24 @@ def collect_acceptance(contract: str, published_pr: str | None,
             for check in selected:
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
+                workflow = None
+                check_suite = check.get("check_suite")
+                check_app = check.get("app")
+                suite_id = check_suite.get("id") if isinstance(check_suite, dict) else None
+                app_slug = check_app.get("slug") if isinstance(check_app, dict) else None
+                if is_run and outcome == "skipped" and app_slug == "github-actions" and type(suite_id) is int:
+                    workflow = workflow_by_suite.get(suite_id)
+                classification = "skipped" if workflow else _classify(check, sha, outcome, is_run)
+                outcomes.append("success" if workflow else classification)
+                check_receipt = {"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                    "classification": classification, "conclusion": outcome}
+                if workflow:
+                    check_receipt["workflow_evidence"] = {"run_id": workflow["run_id"],
+                        "check_suite_id": workflow["check_suite_id"],
+                        "rationale": "Skipped GitHub Actions check belongs to an exact-head successful workflow run."}
+                receipt["checks"].append(check_receipt)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):

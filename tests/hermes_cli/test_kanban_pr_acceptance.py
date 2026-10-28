@@ -13,7 +13,10 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [], "workflow_runs": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             "workflow_runs": [{"id": 90, "name": "CI", "head_sha": "a" * 40,
+                 "status": "completed", "conclusion": "success", "check_suite_id": 1,
+                 "html_url": "https://github.com/acme/repo/actions/runs/90"}]}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -43,6 +46,8 @@ def github(tmp_path, monkeypatch):
                 optional_count = state.get("optional_count", 100)
                 value = [{"total_count": optional_count + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional",
+                     "app": {**run["app"], "slug": state.get("app_slug", "github-actions")},
+                     "check_suite": {"id": state.get("optional_suite_id", run["check_suite"]["id"])},
                      "conclusion": state.get("optional_conclusion", "skipped")}
                     for i in range(optional_count)]},
                     {"total_count": optional_count + len(runs), "check_runs": runs}]
@@ -53,8 +58,11 @@ def github(tmp_path, monkeypatch):
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/actions/runs" in self.path:
-                value = [{"total_count": len(state["workflow_runs"]),
-                          "workflow_runs": state["workflow_runs"]}]
+                workflow_runs = state["workflow_runs"]
+                if state.get("malformed_workflow_page"):
+                    workflow_runs = "invalid"
+                value = [{"total_count": len(state["workflow_runs"]) + state.get("workflow_total_delta", 0),
+                          "workflow_runs": workflow_runs}]
             elif "/statuses" in self.path:
                 value = [state.get("statuses", [])]
             elif "/pulls/" in self.path:
@@ -263,7 +271,7 @@ _PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable 
 @pytest.mark.parametrize(("fault", "classification"), [
     (None, "success"), ("failure", "failure"), ("pending", "pending"),
     ("stale", "stale"), ("head_change", "stale"), ("missing", "missing"),
-    ("no_required", "infra"),
+    ("no_required", "success"),
 ])
 def test_plan_unavailable_rules_preserve_required_exact_head_gate(github, fault, classification):
     github["api_error"] = (403, _PLAN_MESSAGE)
@@ -336,8 +344,8 @@ def test_malformed_rules_error_cannot_enable_plan_exception(monkeypatch, body):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("plan_limited", [False, True])
 @pytest.mark.parametrize(("fault", "classification"), [
-    (None, "success"), ("failure", "failure"), ("pending", "pending"),
-    ("cancelled", "infra"), ("neutral", "infra"), ("skipped", "infra"),
+    (None, "success"),    ("failure", "failure"), ("pending", "pending"),
+    ("cancelled", "infra"), ("neutral", "infra"), ("skipped", "success"),
     ("timed_out", "infra"), ("action_required", "infra"),
     ("unknown", "infra"), ("no_conclusion", "infra"),
     ("missing", "missing"), ("stale", "stale"),
@@ -381,9 +389,10 @@ def test_optional_checks_matter_only_without_required_checks(github, required_so
         github["rules"] = [{"type": "required_status_checks", "parameters": {
             "required_status_checks": [{"context": "required", "integration_id": 1}]}}]
     receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
-    assert receipt["ok"] is (required_source is not None or optional_conclusion == "success")
+    assert receipt["ok"] is (required_source is not None or optional_conclusion in {"success", "skipped"})
     assert len(receipt["checks"]) == (1 if required_source else 101)
     assert {c["head_sha"] for c in receipt["checks"]} == {"a" * 40}
+    assert any("/actions/runs" in p for p in github["requests"]) is (required_source is None)
 
 
 @pytest.mark.platforms("posix")
@@ -427,3 +436,46 @@ def test_no_required_checks_accept_mapped_skips_only_with_successful_exact_head_
     assert {check["classification"] for check in receipt["checks"] if check["conclusion"] == "skipped"} == {"skipped"}
     assert all(check["workflow_evidence"]["run_id"] == 99 for check in receipt["checks"]
                if check["conclusion"] == "skipped")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("fault", "classification"), [
+    ("failure", "infra"), ("pending", "infra"), ("cancelled", "infra"),
+    ("skipped", "infra"), ("neutral", "infra"), ("unknown", "infra"),
+    ("wrong_head", "infra"), ("zero", "infra"), ("bad_count", "infra"),
+    ("malformed", "infra"), ("duplicate", "infra"), ("unknown_suite", "infra"),
+    ("external_skip", "infra"), ("external_failure", "failure"), ("external_pending", "pending"),
+    ("multiple_failure", "infra"), ("api_403", "auth"), ("api_500", "infra"),
+])
+def test_no_required_checks_fail_closed_on_unproven_workflow_skip(github, fault, classification):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=1, optional_conclusion="skipped")
+    workflow = github["workflow_runs"][0]
+    if fault in {"failure", "pending", "cancelled", "skipped", "neutral", "unknown"}:
+        workflow["conclusion"] = fault
+        workflow["status"] = "in_progress" if fault == "pending" else "completed"
+    elif fault == "wrong_head":
+        workflow["head_sha"] = "b" * 40
+    elif fault == "zero":
+        github["workflow_runs"] = []
+    elif fault == "bad_count":
+        github["workflow_total_delta"] = 1
+    elif fault == "duplicate":
+        github["workflow_runs"] = [workflow, dict(workflow)]
+    elif fault == "unknown_suite":
+        github["suite_id"] = 55
+    elif fault in {"external_skip", "external_failure", "external_pending"}:
+        github["app_slug"] = "third-party"
+        github["optional_conclusion"] = {"external_skip": "skipped", "external_failure": "failure",
+                                         "external_pending": "pending"}[fault]
+    elif fault == "malformed":
+        github["malformed_workflow_page"] = True
+    elif fault == "multiple_failure":
+        github["workflow_runs"].append({**workflow, "id": 91, "check_suite_id": 2, "conclusion": "failure"})
+    elif fault in {"api_403", "api_500"}:
+        github.update(api_error=(403 if fault == "api_403" else 500, "unavailable"),
+                      error_path="/actions/runs")
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == classification
