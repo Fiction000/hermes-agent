@@ -13,7 +13,7 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [], "workflow_runs": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -34,7 +34,8 @@ def github(tmp_path, monkeypatch):
                 value = [state.get("rules", [])]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "app": {"id": 1, "slug": "github-actions"}, "check_suite": {"id": state.get("suite_id", 1)},
+                       "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
@@ -51,6 +52,9 @@ def github(tmp_path, monkeypatch):
                     state["race"]()
                 if state.get("head_change"):
                     state["head"] = "b" * 40
+            elif "/actions/runs" in self.path:
+                value = [{"total_count": len(state["workflow_runs"]),
+                          "workflow_runs": state["workflow_runs"]}]
             elif "/statuses" in self.path:
                 value = [state.get("statuses", [])]
             elif "/pulls/" in self.path:
@@ -406,3 +410,20 @@ def test_no_required_checks_do_not_hide_unsuccessful_legacy_status(github):
     assert not receipt["ok"]
     assert receipt["classification"] == "pending"
     assert {c["id"] for c in receipt["checks"]} == {42, 43, 44}
+
+
+@pytest.mark.platforms("posix")
+def test_no_required_checks_accept_mapped_skips_only_with_successful_exact_head_workflow(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=3, optional_conclusion="skipped",
+                  suite_id=77, workflow_runs=[{"id": 99, "name": "Reader CI", "head_sha": "a" * 40,
+                      "status": "completed", "conclusion": "success", "check_suite_id": 77,
+                      "html_url": "https://github.com/acme/repo/actions/runs/99"}])
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"]
+    assert receipt["classification"] == "success"
+    assert len(receipt["workflows"]) == 1
+    assert {check["classification"] for check in receipt["checks"] if check["conclusion"] == "skipped"} == {"skipped"}
+    assert all(check["workflow_evidence"]["run_id"] == 99 for check in receipt["checks"]
+               if check["conclusion"] == "skipped")
