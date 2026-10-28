@@ -38,7 +38,7 @@ def github(tmp_path, monkeypatch):
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
                        "app": {"id": 1, "slug": "github-actions"}, "check_suite": {"id": state.get("suite_id", 1)},
-                       "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "status": state.get("check_status", "in_progress" if state["conclusion"] == "pending" else "completed"), "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
@@ -436,6 +436,46 @@ def test_no_required_checks_accept_mapped_skips_only_with_successful_exact_head_
     assert {check["classification"] for check in receipt["checks"] if check["conclusion"] == "skipped"} == {"skipped"}
     assert all(check["workflow_evidence"]["run_id"] == 99 for check in receipt["checks"]
                if check["conclusion"] == "skipped")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("fault", "classification"), [
+    ("stale", "stale"), ("in_progress", "pending"),
+])
+def test_mapped_skips_still_require_current_completed_check(github, fault, classification):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=1, optional_conclusion="skipped",
+                  conclusion="skipped", suite_id=77,
+                  workflow_runs=[{"id": 99, "name": "Reader CI", "head_sha": "a" * 40,
+                      "status": "completed", "conclusion": "success", "check_suite_id": 77,
+                      "html_url": "https://github.com/acme/repo/actions/runs/99"}])
+    if fault == "stale":
+        github["stale"] = True
+    else:
+        github["check_status"] = "in_progress"
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == classification
+    assert all(check["conclusion"] == "skipped" for check in receipt["checks"])
+    assert all(check["head_sha"] == ("b" * 40 if fault == "stale" else "a" * 40)
+               for check in receipt["checks"])
+    assert all("workflow_evidence" not in check for check in receipt["checks"])
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("bad_id", [0, -1, None, True, "99"])
+def test_mapped_skips_reject_invalid_workflow_run_id(github, bad_id):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    github.update(no_required=True, optional_count=1, optional_conclusion="skipped",
+                  conclusion="skipped", suite_id=77,
+                  workflow_runs=[{"id": bad_id, "name": "Reader CI", "head_sha": "a" * 40,
+                      "status": "completed", "conclusion": "success", "check_suite_id": 77,
+                      "html_url": "https://github.com/acme/repo/actions/runs/99"}])
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert not receipt["ok"]
+    assert receipt["classification"] == "infra"
 
 
 @pytest.mark.platforms("posix")
