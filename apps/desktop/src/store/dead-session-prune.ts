@@ -16,8 +16,10 @@
  * is declared dead ONLY when a by-id probe 404s on every known profile — a 404
  * is profile-scoped ("not on this profile's state.db"), so a single miss never
  * prunes anything (a session can legitimately live on a non-active profile).
- * Any non-404 probe failure (gateway mid-restart, network) is inconclusive:
- * the id is deferred to a later pass instead of being dropped.
+ * Any non-404 probe failure (gateway mid-restart, network, a profile whose
+ * ticket is refused) is inconclusive: the id is deferred to a later pass
+ * instead of being dropped, with a backoff that doubles per consecutive
+ * inconclusive verdict so one failing profile cannot be re-asked every sweep.
  */
 
 import { getSession } from '@/hermes'
@@ -41,10 +43,15 @@ const RERUN_DELAY_MS = 5_000
 // exactly the boot 404s this prune exists to remove. With expiry, a later
 // sweep re-probes and heals it within one TTL.
 const ALIVE_TTL_MS = 10 * 60_000
+const UNKNOWN_RETRY_BASE_MS = 60_000
+const UNKNOWN_RETRY_MAX_MS = 30 * 60_000
 
 // Ids verified ALIVE this app session, id -> verdict expiry timestamp — later
 // sweeps skip re-probing ids whose verdict is still fresh.
 const alive = new Map<string, number>()
+// Ids whose last probes were inconclusive, id -> consecutive count and the
+// earliest time a sweep may probe them again.
+const deferred = new Map<string, { retryAt: number; unknowns: number }>()
 // Ids currently mid-probe, so overlapping sweeps don't double-probe.
 const inFlight = new Set<string>()
 
@@ -77,12 +84,6 @@ function isNotFoundError(error: unknown): boolean {
  */
 async function sessionVerdict(id: string): Promise<Verdict> {
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
-
-  // No known profiles → another profile we can't rule out might own the id.
-  // Skip the probe entirely; there is nothing to gain from a lone unscoped hit.
-  if ($profiles.get().length === 0) {
-    return 'unknown'
-  }
 
   try {
     await getSession(id)
@@ -142,29 +143,27 @@ function collectCandidates(): string[] {
     }
   }
 
-  for (const scope of stashedDraftScopes()) {
-    if (!covered.has(scope)) {
-      candidates.add(scope)
-    }
-  }
-
-  for (const key of Object.keys($queuedPromptsBySession.get())) {
-    if (!covered.has(key)) {
-      candidates.add(key)
-    }
-  }
-
-  // Fresh-chat keys are never session references (they expire with the outbox entry instead).
-  for (const scope of interruptedSendScopes()) {
+  // Fresh-chat keys (`__new__`, `__new__:<uuid>`) are never session
+  // references: a probe can only fail, and a 404 would discard live text.
+  for (const scope of [
+    ...stashedDraftScopes(),
+    ...Object.keys($queuedPromptsBySession.get()),
+    ...interruptedSendScopes()
+  ]) {
     if (!covered.has(scope) && !isFreshDraftScope(scope)) {
       candidates.add(scope)
     }
   }
 
-  return [...candidates].filter(id => {
-    const expiresAt = alive.get(id)
+  const now = Date.now()
 
-    return !(expiresAt !== undefined && Date.now() < expiresAt) && !inFlight.has(id)
+  return [...candidates].filter(id => {
+    const aliveUntil = alive.get(id)
+    const retryAt = deferred.get(id)?.retryAt
+
+    return (
+      !(aliveUntil !== undefined && now < aliveUntil) && !(retryAt !== undefined && now < retryAt) && !inFlight.has(id)
+    )
   })
 }
 
@@ -208,6 +207,12 @@ async function sweepOnce(requireLoaded = true): Promise<void> {
     return
   }
 
+  // No known profiles → another profile we can't rule out might own any id.
+  // Probe nothing, so no id starts a backoff it did not earn.
+  if ($profiles.get().length === 0) {
+    return
+  }
+
   const sweepEpoch = epoch
   const candidates = collectCandidates()
 
@@ -233,12 +238,21 @@ async function sweepOnce(requireLoaded = true): Promise<void> {
         return
       }
 
+      if (verdict === 'unknown') {
+        const unknowns = (deferred.get(id)?.unknowns ?? 0) + 1
+        const backoff = Math.min(UNKNOWN_RETRY_BASE_MS * 2 ** (unknowns - 1), UNKNOWN_RETRY_MAX_MS)
+        deferred.set(id, { retryAt: Date.now() + backoff, unknowns })
+
+        return
+      }
+
+      deferred.delete(id)
+
       if (verdict === 'alive') {
         alive.set(id, Date.now() + ALIVE_TTL_MS)
-      } else if (verdict === 'dead') {
+      } else {
         dropDeadId(id)
       }
-      // 'unknown' — neither cached nor dropped; a later sweep retries it.
     })
   } finally {
     for (const id of candidates) {
@@ -302,6 +316,7 @@ export function watchDeadSessionPrune(): () => void {
 export function resetDeadSessionPrune(): void {
   epoch += 1
   alive.clear()
+  deferred.clear()
   inFlight.clear()
   listLoaded = false
 

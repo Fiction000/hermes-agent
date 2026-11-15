@@ -98,19 +98,137 @@ describe('__runDeadSessionPrunePass', () => {
   })
 
   it('defers on non-404 probe failures instead of dropping, and retries later', async () => {
+    vi.useFakeTimers()
+
+    try {
+      $sessions.set([row('unrelated')])
+      $pinnedSessionIds.set(['flaky-pin'])
+      getSessionMock.mockRejectedValue(new Error('gateway restarting'))
+
+      await __runDeadSessionPrunePass()
+
+      expect($pinnedSessionIds.get()).toEqual(['flaky-pin'])
+
+      // Not cached as alive: a later pass probes again, and a definitive 404 prunes.
+      vi.setSystemTime(Date.now() + 30 * 60_000)
+      getSessionMock.mockRejectedValue(notFound())
+      await __runDeadSessionPrunePass()
+
+      expect($pinnedSessionIds.get()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('backs off an id whose probe keeps failing instead of re-probing it every sweep', async () => {
+    vi.useFakeTimers()
+
+    try {
+      $sessions.set([row('unrelated')])
+      $pinnedSessionIds.set(['ticket-pin'])
+      getSessionMock.mockImplementation(async (_id, profileName) => {
+        if (profileName === 'work') {
+          throw new Error('Invalid gateway ticket response')
+        }
+
+        throw notFound()
+      })
+
+      await __runDeadSessionPrunePass()
+      expect(getSessionMock).toHaveBeenCalledWith('ticket-pin', 'work')
+
+      getSessionMock.mockClear()
+      await __runDeadSessionPrunePass()
+      await __runDeadSessionPrunePass()
+      expect(getSessionMock).not.toHaveBeenCalled()
+
+      // The id is deferred, not abandoned: once the failing profile answers,
+      // a later pass still prunes it.
+      vi.setSystemTime(Date.now() + 30 * 60_000)
+      getSessionMock.mockRejectedValue(notFound())
+      await __runDeadSessionPrunePass()
+
+      expect(getSessionMock).toHaveBeenCalledWith('ticket-pin', 'work')
+      expect($pinnedSessionIds.get()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits longer after each consecutive inconclusive probe', async () => {
+    vi.useFakeTimers()
+
+    try {
+      $sessions.set([row('unrelated')])
+      $pinnedSessionIds.set(['stubborn-pin'])
+      getSessionMock.mockRejectedValue(new Error('Invalid gateway ticket response'))
+
+      const probesAfter = async (ms: number) => {
+        vi.setSystemTime(Date.now() + ms)
+        getSessionMock.mockClear()
+        await __runDeadSessionPrunePass()
+
+        return getSessionMock.mock.calls.length
+      }
+
+      await __runDeadSessionPrunePass()
+
+      let waited = 0
+      let firstGap = 0
+
+      while (firstGap === 0 && waited < 60 * 60_000) {
+        waited += 5_000
+
+        if ((await probesAfter(5_000)) > 0) {
+          firstGap = waited
+        }
+      }
+
+      expect(firstGap).toBeGreaterThan(0)
+      // The same gap again is not enough after a second failure in a row.
+      expect(await probesAfter(firstGap)).toBe(0)
+      expect($pinnedSessionIds.get()).toEqual(['stubborn-pin'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resetDeadSessionPrune lets a backed-off id be probed on the switched gateway', async () => {
     $sessions.set([row('unrelated')])
-    $pinnedSessionIds.set(['flaky-pin'])
-    getSessionMock.mockRejectedValue(new Error('gateway restarting'))
+    $pinnedSessionIds.set(['parked-pin'])
+    getSessionMock.mockRejectedValue(new Error('Invalid gateway ticket response'))
 
     await __runDeadSessionPrunePass()
 
-    expect($pinnedSessionIds.get()).toEqual(['flaky-pin'])
-
-    // Not cached — the next pass probes again, and a definitive 404 prunes.
+    resetDeadSessionPrune()
+    getSessionMock.mockReset()
     getSessionMock.mockRejectedValue(notFound())
+
     await __runDeadSessionPrunePass()
 
     expect($pinnedSessionIds.get()).toEqual([])
+  })
+
+  it('never probes or clears a fresh chat draft or its queued prompts', async () => {
+    const draftScope = '__new__:0b9f3c2e-5d0a-4a8e-9f61-3c7d2e1a4b50'
+    const queueScope = '__new__:7e2a9d14-c3b8-4f05-a6d1-92b0e8f3c417'
+
+    $sessions.set([row('unrelated')])
+    stashSessionDraft(draftScope, 'still typing', [])
+    enqueueQueuedPrompt(queueScope, { text: 'follow-up', attachments: [] })
+    getSessionMock.mockRejectedValue(notFound())
+
+    try {
+      await __runDeadSessionPrunePass()
+
+      const probed = getSessionMock.mock.calls.map(([id]) => id)
+      expect(probed).not.toContain(draftScope)
+      expect(probed).not.toContain(queueScope)
+      expect(takeSessionDraft(draftScope).text).toBe('still typing')
+      expect(getQueuedPrompts(queueScope).map(entry => entry.text)).toEqual(['follow-up'])
+    } finally {
+      clearSessionDraft(draftScope)
+    }
   })
 
   it('discards drafts for dead sessions but never the new-chat draft', async () => {
